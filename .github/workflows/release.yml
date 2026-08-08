@@ -101,9 +101,9 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             gh release upload $env:RELEASE_TAG $installer.FullName --clobber
             if ($LASTEXITCODE -ne 0) { throw "Could not overwrite release asset." }
-            gh release edit $env:RELEASE_TAG --title "Roto Now $env:RELEASE_VERSION" --prerelease --latest
+            gh release edit $env:RELEASE_TAG --title "Roto Now $env:RELEASE_VERSION" --prerelease
             if ($LASTEXITCODE -ne 0) { throw "Could not update release metadata." }
           } else {
-            gh release create $env:RELEASE_TAG $installer.FullName --verify-tag --title "Roto Now $env:RELEASE_VERSION" --generate-notes --prerelease --latest
+            gh release create $env:RELEASE_TAG $installer.FullName --verify-tag --title "Roto Now $env:RELEASE_VERSION" --generate-notes --prerelease
             if ($LASTEXITCODE -ne 0) { throw "Could not create release." }
           }
