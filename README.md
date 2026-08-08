@@ -1,28 +1,36 @@
 # Roto Now
 
-Roto Now is a Windows-first Tauri prototype for local AI-assisted rotoscoping.
+Roto Now is a Windows-first Tauri desktop app for fully local AI-assisted rotoscoping and background removal.
 
-## Prototype scope
+## Public alpha scope
 
-- Image input → transparent PNG
-- Video input → green-screen or blue-screen MP4
-- General and anime model routing
-- Fully local processing architecture
+- Images produce transparent PNG results.
+- Videos produce green- or blue-screen H.264 MP4 files with source audio.
+- A one-second, 12 fps preview starts at the current video playhead and is capped at 1280×720.
+- General Lite is bundled in the installer and copied into the per-user app-data directory on first run. General Maximum and Anime remain verified on-demand downloads.
+- Native Rust runs pinned `ort`/ONNX Runtime inference with DirectML and automatic CPU fallback.
+- Pinned FFmpeg 8.1.2 `ffmpeg.exe` and `ffprobe.exe` are packaged in the NSIS installer. End users need no Python, Node, Rust, or separate FFmpeg install.
+- One foreground job runs at a time. Image/model phases use indeterminate progress; downloads use bytes; videos use frames and show ETA after three frames.
 
-The current prototype implements the new interface, native file dialogs, image and video input, local model inference, transparent PNG export, and H.264 MP4 export with preserved source audio.
-
-Processing first creates a temporary local result so users can switch between Input and Output previews. The Save dialog only appears after processing when the user chooses to save the result. Temporary results are removed when they are replaced or dismissed.
-
-Image processing uses BiRefNet General or ToonOut through ONNX Runtime. Video processing keeps one inference session alive, segments each frame, composites it over the selected green or blue screen, and uses the FFmpeg binary bundled by `imageio-ffmpeg` to encode and restore audio. DirectML is preferred, with automatic CPU fallback if the GPU runs out of memory. Models are downloaded into `.models` on first use.
-
-Video masks are currently inferred independently per frame. Temporal mask propagation and progress/cancellation controls are later milestones.
+Temporal mask stabilization is intentionally deferred. Every frame is segmented independently in this milestone.
 
 ## Development
 
+Install Node.js, Rust, and Visual Studio Build Tools with the **Desktop development with C++** workload and a Windows SDK, then run:
+
 ```powershell
 npm install
-.\scripts\setup-inference.ps1
 .\scripts\tauri-dev.ps1
 ```
 
-The Rust stable toolchain is installed project-locally under `.toolchains`. The Tauri build also requires Visual Studio Build Tools with the **Desktop development with C++** workload and a Windows SDK.
+The development script downloads and verifies the pinned FFmpeg binaries. Models are installed through the app's first-run onboarding. Python workers under `backend/` remain parity references and are not shipped.
+
+Build the public-alpha NSIS installer with:
+
+```powershell
+.\scripts\fetch-ffmpeg.ps1
+.\scripts\fetch-general-lite.ps1
+npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis
+```
+
+Every push to `main` builds and publishes the Windows release named from `package.json`. If that version already has a release, its tag is moved to the new commit and its installer asset is overwritten. Changing the package version creates a new release. If the `WINDOWS_SIGNING_CERTIFICATE` and `WINDOWS_SIGNING_PASSWORD` repository secrets are present, the installer is Authenticode-signed before upload.

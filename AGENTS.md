@@ -7,11 +7,11 @@ Roto Now is a Windows-first Tauri desktop application for fully local background
 ## Architecture
 
 - `src/`: React and TypeScript interface. Keep native calls behind Tauri commands and retain the browser-only fallback where practical.
-- `src-tauri/`: Rust command boundary, media inspection, managed temporary outputs, saving, and cleanup.
-- `backend/worker.py`: Image inference using BiRefNet General or ToonOut through ONNX Runtime.
-- `backend/video_worker.py`: Persistent segmentation session, per-frame compositing, FFmpeg encoding, and audio muxing.
-- `.models/`: Downloaded model weights. Never commit this directory.
-- `.python-env/` and `.toolchains/`: Project-local runtimes. Never commit or hand-edit generated package contents.
+- `src-tauri/`: Native Rust jobs, model downloads, ONNX Runtime inference, FFmpeg video processing, managed outputs, saving, and cleanup.
+- `backend/worker.py` and `backend/video_worker.py`: Non-shipped Python parity references only.
+- `src-tauri/bin/`: Locally fetched FFmpeg binaries. Never commit the executables; reproduce them with `scripts/fetch-ffmpeg.ps1`.
+- General Lite is fetched into `src-tauri/models/` for installer builds, then seeded into Tauri's per-user app-data folder on first run. Other models are downloaded there on demand. Never commit model weights.
+- `.python-env/` and `.toolchains/`: Test-reference and project-local runtimes. Never commit or hand-edit generated package contents.
 
 ## Development commands
 
@@ -19,7 +19,8 @@ Run commands from the repository root in PowerShell:
 
 ```powershell
 npm.cmd run build
-.\scripts\setup-inference.ps1
+.\scripts\fetch-ffmpeg.ps1
+.\scripts\fetch-general-lite.ps1
 .\scripts\tauri-dev.ps1
 ```
 

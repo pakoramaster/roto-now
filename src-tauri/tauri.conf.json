@@ -33,7 +33,19 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "useLocalToolsDir": true,
+    "targets": ["nsis"],
+    "resources": [
+      "bin/ffmpeg.exe",
+      "bin/ffprobe.exe",
+      "models/birefnet-general-lite.onnx",
+      "THIRD_PARTY_NOTICES.md"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    },
     "shortDescription": "Local AI-assisted rotoscoping",
     "longDescription": "Remove image backgrounds and create green or blue screen video locally."
   }

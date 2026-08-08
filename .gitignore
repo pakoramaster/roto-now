@@ -1,7 +1,11 @@
 /node_modules
 /dist
 /.npm-cache
+/.cache
 /src-tauri/target
+/src-tauri/bin/*.exe
+/src-tauri/models/*.onnx
+/src-tauri/models/*.part
 /.toolchains
 /.python-env
 /.models
