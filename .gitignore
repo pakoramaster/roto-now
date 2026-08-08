@@ -1,0 +1,11 @@
+/node_modules
+/dist
+/.npm-cache
+/src-tauri/target
+/.toolchains
+/.python-env
+/.models
+/.runtime-test
+/backend/__pycache__
+*.log
+.DS_Store
