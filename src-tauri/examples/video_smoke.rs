@@ -1,4 +1,9 @@
-use roto_now_lib::{jobs::JobControl, models::ModelId, video::process_video_with_paths};
+use roto_now_lib::{
+    corrections::{CorrectionPoint, CorrectionStroke, VideoCorrectionStroke},
+    jobs::JobControl,
+    models::ModelId,
+    video::process_video_with_paths,
+};
 use std::{
     path::PathBuf,
     sync::{
@@ -10,7 +15,7 @@ use std::{
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 7 {
-        return Err("usage: video_smoke <model.onnx> <ffmpeg.exe> <ffprobe.exe> <input> <output.mp4> <preview|full>".into());
+        return Err("usage: video_smoke <model.onnx> <ffmpeg.exe> <ffprobe.exe> <input> <output.mp4> <preview|fast|full|maximum|corrected>".into());
     }
     let cancelled = Arc::new(AtomicBool::new(false));
     let control = JobControl {
@@ -19,6 +24,22 @@ fn main() -> Result<(), String> {
         progress_high_water: Arc::new(AtomicU64::new(0)),
     };
     let preview = args[6] == "preview";
+    let quality = match args[6].as_str() {
+        "fast" => "Fast",
+        "maximum" => "Maximum",
+        _ => "Balanced",
+    };
+    let corrections = (args[6] == "corrected")
+        .then(|| VideoCorrectionStroke {
+            time_seconds: 0.5,
+            stroke: CorrectionStroke {
+                mode: "erase".into(),
+                radius: 0.08,
+                points: vec![CorrectionPoint { x: 0.5, y: 0.5 }],
+            },
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
     if args[6] == "cancel" {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(8));
@@ -35,9 +56,11 @@ fn main() -> Result<(), String> {
         PathBuf::from(&args[2]).as_path(),
         PathBuf::from(&args[3]).as_path(),
         72,
+        quality,
         "green",
         preview,
         0.0,
+        &corrections,
     );
     if args[6] == "cancel" {
         match result {

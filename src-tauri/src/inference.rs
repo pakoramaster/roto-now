@@ -1,6 +1,7 @@
 use crate::{
     jobs::JobControl,
     models::{model_path, ModelId},
+    routing::QualityMode,
 };
 use image::{imageops::FilterType, DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma};
 use ort::{
@@ -108,12 +109,18 @@ impl Masker {
         &mut self,
         source: &DynamicImage,
         edge_detail: u8,
+        quality: &str,
         control: &JobControl,
     ) -> Result<DynamicImage, String> {
         let (width, height) = source.dimensions();
         let source_rgb = source.to_rgb8();
-        let rgb =
-            image::imageops::resize(&source_rgb, INPUT_SIZE, INPUT_SIZE, FilterType::Lanczos3);
+        let quality = QualityMode::parse(quality)?;
+        let resize_filter = if quality == QualityMode::Fast {
+            FilterType::Triangle
+        } else {
+            FilterType::Lanczos3
+        };
+        let rgb = image::imageops::resize(&source_rgb, INPUT_SIZE, INPUT_SIZE, resize_filter);
         let divisor = if self.model_id == ModelId::Anime {
             255.0
         } else {
@@ -178,7 +185,7 @@ impl Masker {
             .collect();
         let small = GrayImage::from_raw(INPUT_SIZE, INPUT_SIZE, raw)
             .ok_or("Could not construct output mask")?;
-        let resized = image::imageops::resize(&small, width, height, FilterType::Lanczos3);
+        let resized = image::imageops::resize(&small, width, height, resize_filter);
         let alpha = refine_alpha(&resized, edge_detail);
         let mut rgba = source.to_rgba8();
         for (pixel, alpha) in rgba.pixels_mut().zip(alpha.pixels()) {

@@ -26,6 +26,7 @@ pub struct ModelStatus {
     pub name: &'static str,
     pub size: u64,
     pub installed: bool,
+    pub managed: bool,
     pub state: &'static str,
     pub provider: &'static str,
 }
@@ -93,7 +94,36 @@ pub fn model_root(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 pub fn model_path(app: &AppHandle, id: ModelId) -> Result<PathBuf, String> {
+    let managed = managed_model_path(app, id)?;
+    if managed.is_file() {
+        return Ok(managed);
+    }
+    #[cfg(debug_assertions)]
+    if let Some(local) = development_model_path(id) {
+        if local.is_file() {
+            return Ok(local);
+        }
+    }
+    Ok(managed)
+}
+
+fn managed_model_path(app: &AppHandle, id: ModelId) -> Result<PathBuf, String> {
     Ok(model_root(app)?.join(spec(id).file))
+}
+
+#[cfg(debug_assertions)]
+fn development_model_path(id: ModelId) -> Option<PathBuf> {
+    let root = std::env::var_os("ROTO_NOW_MODEL_ROOT").map(PathBuf::from)?;
+    Some(development_model_path_from_root(&root, id))
+}
+
+fn development_model_path_from_root(root: &Path, id: ModelId) -> PathBuf {
+    let folder = if id == ModelId::Anime {
+        "toonout"
+    } else {
+        "rembg"
+    };
+    root.join(folder).join(spec(id).file)
 }
 
 fn seed_bundled_general_lite(app: &AppHandle) -> Result<(), String> {
@@ -137,9 +167,15 @@ fn seed_bundled_general_lite(app: &AppHandle) -> Result<(), String> {
 }
 
 fn status_for(app: &AppHandle, item: &'static ModelSpec) -> ModelStatus {
+    let managed_path = managed_model_path(app, item.id).ok();
     let path = model_path(app, item.id).ok();
     let installed = path.as_ref().map(|path| path.is_file()).unwrap_or(false);
-    let partial = path
+    let managed = installed
+        && path
+            .as_ref()
+            .zip(managed_path.as_ref())
+            .is_some_and(|(resolved, managed)| resolved == managed);
+    let partial = managed_path
         .as_ref()
         .map(|path| path.with_extension("onnx.part").is_file())
         .unwrap_or(false);
@@ -148,7 +184,10 @@ fn status_for(app: &AppHandle, item: &'static ModelSpec) -> ModelStatus {
         name: item.name,
         size: item.size,
         installed,
-        state: if installed {
+        managed,
+        state: if installed && !managed {
+            "local"
+        } else if installed {
             "ready"
         } else if partial {
             "partial"
@@ -339,7 +378,7 @@ pub fn download_model(
     state: State<'_, JobState>,
     model_id: ModelId,
 ) -> Result<String, String> {
-    let destination = model_path(&app, model_id)?;
+    let destination = managed_model_path(&app, model_id)?;
     let control = state.begin()?;
     let job_id = control.id.clone();
     let item = spec(model_id);
@@ -402,7 +441,7 @@ pub fn download_model(
 
 #[tauri::command]
 pub fn remove_model(app: AppHandle, model_id: ModelId) -> Result<(), String> {
-    let path = model_path(&app, model_id)?;
+    let path = managed_model_path(&app, model_id)?;
     if path.exists() {
         std::fs::remove_file(&path).map_err(|error| format!("Could not remove model: {error}"))?;
     }
@@ -431,5 +470,18 @@ mod tests {
             assert!(model.sha256.bytes().all(|value| value.is_ascii_hexdigit()));
             assert!(model.size > 200_000_000);
         }
+    }
+
+    #[test]
+    fn development_models_follow_the_reference_folder_layout() {
+        let root = Path::new("test-models");
+        assert_eq!(
+            development_model_path_from_root(root, ModelId::General),
+            root.join("rembg").join("birefnet-general.onnx")
+        );
+        assert_eq!(
+            development_model_path_from_root(root, ModelId::Anime),
+            root.join("toonout").join("birefnet-toonout-fp16.onnx")
+        );
     }
 }
