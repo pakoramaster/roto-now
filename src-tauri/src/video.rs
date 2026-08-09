@@ -2,6 +2,7 @@ use crate::{
     inference::{composite_screen, Masker},
     jobs::{emit_progress, JobControl},
     models::ModelId,
+    temporal::TemporalMaskStabilizer,
 };
 use image::{DynamicImage, ImageBuffer, Rgb};
 use serde::Deserialize;
@@ -347,6 +348,7 @@ pub fn process_video_with_paths(
     let mut bytes = vec![0_u8; frame_size];
     let mut frame_count = 0_u64;
     let mut ewma: Option<f64> = None;
+    let mut stabilizer = TemporalMaskStabilizer::default();
     let result = loop {
         if control.cancelled.load(Ordering::SeqCst) {
             break Err("cancelled".into());
@@ -361,10 +363,13 @@ pub fn process_video_with_paths(
             Some(image) => image,
             None => break Err("Could not construct video frame".into()),
         };
-        let cutout = match masker.apply(&DynamicImage::ImageRgb8(image), edge_detail, control) {
+        let mut cutout = match masker.apply(&DynamicImage::ImageRgb8(image), edge_detail, control) {
             Ok(cutout) => cutout,
             Err(error) => break Err(error),
         };
+        if let Err(error) = stabilizer.apply(&bytes, &mut cutout) {
+            break Err(error);
+        }
         let composited = composite_screen(&cutout, screen_color);
         if let Err(error) = writer.write_all(&composited) {
             break Err(format!("Could not encode video frame: {error}"));

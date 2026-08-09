@@ -1,6 +1,7 @@
 pub mod inference;
 pub mod jobs;
 pub mod models;
+pub mod temporal;
 pub mod video;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};

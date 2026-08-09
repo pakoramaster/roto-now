@@ -11,8 +11,7 @@ Roto Now is a Windows-first Tauri desktop app for fully local AI-assisted rotosc
 - Native Rust runs pinned `ort`/ONNX Runtime inference with DirectML and automatic CPU fallback.
 - Pinned FFmpeg 8.1.2 `ffmpeg.exe` and `ffprobe.exe` are packaged in the NSIS installer. End users need no Python, Node, Rust, or separate FFmpeg install.
 - One foreground job runs at a time. Image/model phases use indeterminate progress; downloads use bytes; videos use frames and show ETA after three frames.
-
-Temporal mask stabilization is intentionally deferred. Every frame is segmented independently in this milestone.
+- Video masks use motion-aware temporal smoothing to reduce frame-to-frame edge flicker. Stabilization resets on scene cuts and moving pixels favor the current mask; this is lightweight mask propagation rather than full object tracking.
 
 ## Development
 
