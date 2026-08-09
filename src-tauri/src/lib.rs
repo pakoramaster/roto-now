@@ -7,7 +7,7 @@ pub mod temporal;
 pub mod video;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use inference::{save_cutout, Masker};
+use inference::{save_cutout, ModelSessionCache};
 use jobs::{emit, emit_progress, JobEvent, JobState, ProcessResult};
 use models::ModelId;
 use parking_lot::Mutex;
@@ -163,15 +163,6 @@ fn start_image_job(
     outputs.outputs.lock().insert(output.clone(), true);
     tauri::async_runtime::spawn_blocking(move || {
         let started = Instant::now();
-        emit_progress(
-            &app_for_task,
-            &control,
-            "loadingModel",
-            None,
-            None,
-            None,
-            "Loading segmentation model",
-        );
         let outcome = (|| {
             let source = match source_for_routing {
                 Some(source) => source,
@@ -179,22 +170,43 @@ fn start_image_job(
                     image::open(&input).map_err(|error| format!("Could not open image: {error}"))?
                 }
             };
-            let mut masker = Masker::load(&app_for_task, model_id, model_id != ModelId::General)?;
-            emit_progress(
-                &app_for_task,
-                &control,
-                "inference",
-                None,
-                None,
-                None,
-                "Removing background",
-            );
-            let cutout = masker.apply(&source, edge_detail, &quality, &control)?;
-            save_cutout(&cutout, &output)?;
-            Ok::<_, String>((
-                masker.provider().to_string(),
-                source.width() as u64 * source.height() as u64,
-            ))
+            app_for_task.state::<ModelSessionCache>().with_model(
+                model_path,
+                model_id,
+                model_id != ModelId::General,
+                || {
+                    emit_progress(
+                        &app_for_task,
+                        &control,
+                        "loadingModel",
+                        None,
+                        None,
+                        None,
+                        "Loading segmentation model",
+                    )
+                },
+                |masker, reused| {
+                    emit_progress(
+                        &app_for_task,
+                        &control,
+                        "inference",
+                        None,
+                        None,
+                        None,
+                        if reused {
+                            "Using loaded model to remove background"
+                        } else {
+                            "Removing background"
+                        },
+                    );
+                    let cutout = masker.apply(&source, edge_detail, &quality, &control)?;
+                    save_cutout(&cutout, &output)?;
+                    Ok((
+                        masker.provider().to_string(),
+                        source.width() as u64 * source.height() as u64,
+                    ))
+                },
+            )
         })();
         match outcome {
             Ok((provider, _)) => emit(
@@ -207,6 +219,11 @@ fn start_image_job(
                         provider,
                         duration_ms: started.elapsed().as_millis() as u64,
                         frame_count: None,
+                        width: None,
+                        height: None,
+                        frame_rate: None,
+                        media_duration_seconds: None,
+                        has_audio: None,
                         preview: false,
                     },
                 },
@@ -261,7 +278,6 @@ fn start_video_job(
     screen_color: String,
     preview: bool,
     start_seconds: Option<f64>,
-    corrections: Option<Vec<corrections::VideoCorrectionStroke>>,
 ) -> Result<String, String> {
     let input = verify_input(&input_path, "video")?;
     if !matches!(screen_color.as_str(), "green" | "blue") {
@@ -295,7 +311,6 @@ fn start_video_job(
     let control = jobs.begin()?;
     let job_id = control.id.clone();
     let app_for_task = app.clone();
-    let corrections = corrections.unwrap_or_default();
     outputs.outputs.lock().insert(output.clone(), !preview);
     tauri::async_runtime::spawn_blocking(move || {
         let started = Instant::now();
@@ -310,7 +325,6 @@ fn start_video_job(
             &screen_color,
             preview,
             start_seconds.unwrap_or(0.0),
-            &corrections,
         );
         match outcome {
             Ok(value) => emit(
@@ -323,6 +337,11 @@ fn start_video_job(
                         provider: value.provider,
                         duration_ms: started.elapsed().as_millis() as u64,
                         frame_count: Some(value.frame_count),
+                        width: Some(value.width),
+                        height: Some(value.height),
+                        frame_rate: Some(value.frame_rate),
+                        media_duration_seconds: Some(value.duration),
+                        has_audio: Some(value.has_audio),
                         preview,
                     },
                 },
@@ -448,6 +467,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(JobState::default())
         .manage(OutputState::default())
+        .manage(ModelSessionCache::default())
         .invoke_handler(tauri::generate_handler![
             engine_status,
             inspect_media,

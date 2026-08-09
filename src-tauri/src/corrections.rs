@@ -20,16 +20,6 @@ pub struct CorrectionStroke {
     pub points: Vec<CorrectionPoint>,
 }
 
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VideoCorrectionStroke {
-    pub time_seconds: f64,
-    #[serde(flatten)]
-    pub stroke: CorrectionStroke,
-}
-
-pub const VIDEO_PROPAGATION_SECONDS: f64 = 0.5;
-
 pub fn apply_corrections(
     image: &mut RgbaImage,
     strokes: &[CorrectionStroke],
@@ -49,36 +39,7 @@ pub fn apply_corrections(
 
     let mut stamps = 0_usize;
     for stroke in strokes {
-        apply_stroke(image, stroke, 1.0, &mut stamps)?;
-    }
-    Ok(())
-}
-
-pub fn apply_video_corrections(
-    image: &mut RgbaImage,
-    strokes: &[VideoCorrectionStroke],
-    time_seconds: f64,
-) -> Result<(), String> {
-    if strokes.len() > MAX_STROKES
-        || strokes
-            .iter()
-            .map(|item| item.stroke.points.len())
-            .sum::<usize>()
-            > MAX_POINTS
-    {
-        return Err("The video correction contains too many brush points".into());
-    }
-    let mut stamps = 0_usize;
-    for item in strokes {
-        if !item.time_seconds.is_finite() || item.time_seconds < 0.0 {
-            return Err("Video correction times must be valid".into());
-        }
-        let distance = (time_seconds - item.time_seconds).abs();
-        if distance > VIDEO_PROPAGATION_SECONDS {
-            continue;
-        }
-        let strength = (1.0 - distance / VIDEO_PROPAGATION_SECONDS) as f32;
-        apply_stroke(image, &item.stroke, strength, &mut stamps)?;
+        apply_stroke(image, stroke, &mut stamps)?;
     }
     Ok(())
 }
@@ -86,7 +47,6 @@ pub fn apply_video_corrections(
 fn apply_stroke(
     image: &mut RgbaImage,
     stroke: &CorrectionStroke,
-    strength: f32,
     stamps: &mut usize,
 ) -> Result<(), String> {
     let restore = match stroke.mode.as_str() {
@@ -97,7 +57,7 @@ fn apply_stroke(
     if !stroke.radius.is_finite() || !(0.002..=0.25).contains(&stroke.radius) {
         return Err("Correction brush size is outside the supported range".into());
     }
-    if stroke.points.is_empty() || strength <= 0.0 {
+    if stroke.points.is_empty() {
         return Ok(());
     }
     for point in &stroke.points {
@@ -112,7 +72,7 @@ fn apply_stroke(
 
     let radius = (stroke.radius * image.width().min(image.height()) as f32).max(1.0);
     let mut previous = &stroke.points[0];
-    stamp(image, previous, radius, restore, strength);
+    stamp(image, previous, radius, restore);
     *stamps += 1;
     for point in stroke.points.iter().skip(1) {
         let dx = (point.x - previous.x) * image.width() as f32;
@@ -128,20 +88,14 @@ fn apply_stroke(
                 x: previous.x + (point.x - previous.x) * amount,
                 y: previous.y + (point.y - previous.y) * amount,
             };
-            stamp(image, &sample, radius, restore, strength);
+            stamp(image, &sample, radius, restore);
         }
         previous = point;
     }
     Ok(())
 }
 
-fn stamp(
-    image: &mut RgbaImage,
-    point: &CorrectionPoint,
-    radius: f32,
-    restore: bool,
-    strength: f32,
-) {
+fn stamp(image: &mut RgbaImage, point: &CorrectionPoint, radius: f32, restore: bool) {
     let center_x = point.x * (image.width().saturating_sub(1)) as f32;
     let center_y = point.y * (image.height().saturating_sub(1)) as f32;
     let min_x = (center_x - radius).floor().max(0.0) as u32;
@@ -160,11 +114,11 @@ fn stamp(
             if distance > radius {
                 continue;
             }
-            let coverage = (if distance <= solid_radius {
+            let coverage = if distance <= solid_radius {
                 1.0
             } else {
                 1.0 - (distance - solid_radius) / (radius - solid_radius).max(f32::EPSILON)
-            }) * strength.clamp(0.0, 1.0);
+            };
             let alpha = &mut image.get_pixel_mut(x, y).0[3];
             if restore {
                 *alpha = (*alpha).max((coverage * 255.0).round() as u8);
@@ -210,31 +164,5 @@ mod tests {
         let mut invalid = stroke("erase");
         invalid.points[0].x = 1.1;
         assert!(apply_corrections(&mut image, &[invalid]).is_err());
-    }
-
-    #[test]
-    fn video_correction_is_strongest_at_its_keyframe() {
-        let timed = VideoCorrectionStroke {
-            time_seconds: 1.0,
-            stroke: stroke("erase"),
-        };
-        let mut at_keyframe = ImageBuffer::from_pixel(20, 20, Rgba([10, 20, 30, 255]));
-        apply_video_corrections(&mut at_keyframe, &[timed.clone()], 1.0).unwrap();
-        let mut nearby = ImageBuffer::from_pixel(20, 20, Rgba([10, 20, 30, 255]));
-        apply_video_corrections(&mut nearby, &[timed], 1.25).unwrap();
-        assert_eq!(at_keyframe.get_pixel(10, 10)[3], 0);
-        assert!(nearby.get_pixel(10, 10)[3] > 0);
-        assert!(nearby.get_pixel(10, 10)[3] < 255);
-    }
-
-    #[test]
-    fn video_correction_does_not_reach_distant_frames() {
-        let timed = VideoCorrectionStroke {
-            time_seconds: 1.0,
-            stroke: stroke("erase"),
-        };
-        let mut image = ImageBuffer::from_pixel(20, 20, Rgba([10, 20, 30, 255]));
-        apply_video_corrections(&mut image, &[timed], 2.0).unwrap();
-        assert_eq!(image.get_pixel(10, 10)[3], 255);
     }
 }

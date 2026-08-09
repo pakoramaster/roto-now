@@ -1,4 +1,4 @@
-name: Windows public alpha
+name: Windows release
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
       - main
 
 concurrency:
-  group: public-alpha-main-release
+  group: windows-main-release
   cancel-in-progress: true
 
 permissions:
@@ -101,9 +101,9 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             gh release upload $env:RELEASE_TAG $installer.FullName --clobber
             if ($LASTEXITCODE -ne 0) { throw "Could not overwrite release asset." }
-            gh release edit $env:RELEASE_TAG --title "Roto Now $env:RELEASE_VERSION" --prerelease
+            gh release edit $env:RELEASE_TAG --title "Roto Now $env:RELEASE_VERSION" --prerelease=false
             if ($LASTEXITCODE -ne 0) { throw "Could not update release metadata." }
           } else {
-            gh release create $env:RELEASE_TAG $installer.FullName --verify-tag --title "Roto Now $env:RELEASE_VERSION" --generate-notes --prerelease
+            gh release create $env:RELEASE_TAG $installer.FullName --verify-tag --title "Roto Now $env:RELEASE_VERSION" --generate-notes
             if ($LASTEXITCODE -ne 0) { throw "Could not create release." }
           }

@@ -9,7 +9,10 @@ use ort::{
     session::{RunOptions, Session},
     value::Tensor,
 };
+use parking_lot::Mutex;
 use std::{
+    collections::HashMap,
+    fs,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -29,6 +32,83 @@ pub struct Masker {
     model_id: ModelId,
     provider: &'static str,
     model_path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModelFingerprint {
+    path: PathBuf,
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl ModelFingerprint {
+    fn read(path: PathBuf) -> Result<Self, String> {
+        let metadata = fs::metadata(&path)
+            .map_err(|error| format!("Could not inspect model {}: {error}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!("Model path is not a file: {}", path.display()));
+        }
+        Ok(Self {
+            path,
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
+struct CachedMasker {
+    fingerprint: ModelFingerprint,
+    masker: Masker,
+}
+
+/// Keeps native ONNX sessions alive between jobs.
+///
+/// Roto Now permits only one foreground job at a time, so holding this lock
+/// through inference also provides the mutable access required by ONNX Runtime.
+#[derive(Default)]
+pub struct ModelSessionCache {
+    entries: Mutex<HashMap<ModelId, CachedMasker>>,
+}
+
+impl ModelSessionCache {
+    pub fn with_model<R>(
+        &self,
+        path: PathBuf,
+        model_id: ModelId,
+        prefer_directml: bool,
+        on_load: impl FnOnce(),
+        operation: impl FnOnce(&mut Masker, bool) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let fingerprint = ModelFingerprint::read(path.clone())?;
+        let mut entries = self.entries.lock();
+        let reused = entries
+            .get(&model_id)
+            .is_some_and(|entry| entry.fingerprint == fingerprint);
+
+        if !reused {
+            // Drop a stale session before loading its replacement to avoid a
+            // large transient memory spike and to release its model file.
+            entries.remove(&model_id);
+            on_load();
+            let masker = Masker::load_from_path(path, model_id, prefer_directml)?;
+            entries.insert(
+                model_id,
+                CachedMasker {
+                    fingerprint,
+                    masker,
+                },
+            );
+        }
+
+        let entry = entries
+            .get_mut(&model_id)
+            .ok_or("The segmentation model cache was not initialized")?;
+        operation(&mut entry.masker, reused)
+    }
+
+    pub fn invalidate(&self, model_id: ModelId) {
+        self.entries.lock().remove(&model_id);
+    }
 }
 
 impl Masker {
@@ -286,10 +366,27 @@ pub fn composite_screen(cutout: &DynamicImage, screen_color: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn alpha_refinement_preserves_hard_limits() {
         let alpha = GrayImage::from_raw(4, 1, vec![0, 2, 253, 255]).unwrap();
         assert_eq!(refine_alpha(&alpha, 72).into_raw(), vec![0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn model_fingerprint_changes_when_file_is_replaced() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("roto-now-model-cache-{suffix}.onnx"));
+        fs::write(&path, b"first").unwrap();
+        let first = ModelFingerprint::read(path.clone()).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        let replacement = ModelFingerprint::read(path.clone()).unwrap();
+        let _ = fs::remove_file(path);
+
+        assert_ne!(first, replacement);
     }
 }

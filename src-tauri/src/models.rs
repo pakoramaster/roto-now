@@ -11,7 +11,7 @@ use std::{
 use tauri::{AppHandle, Manager, State};
 use tokio::io::AsyncWriteExt;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum ModelId {
     GeneralLite,
@@ -376,10 +376,12 @@ fn atomic_replace(source: &Path, destination: &Path) -> Result<(), String> {
 pub fn download_model(
     app: AppHandle,
     state: State<'_, JobState>,
+    cache: State<'_, crate::inference::ModelSessionCache>,
     model_id: ModelId,
 ) -> Result<String, String> {
     let destination = managed_model_path(&app, model_id)?;
     let control = state.begin()?;
+    cache.invalidate(model_id);
     let job_id = control.id.clone();
     let item = spec(model_id);
     let app_for_task = app.clone();
@@ -429,6 +431,11 @@ pub fn download_model(
                         provider: "installed".into(),
                         duration_ms: 0,
                         frame_count: None,
+                        width: None,
+                        height: None,
+                        frame_rate: None,
+                        media_duration_seconds: None,
+                        has_audio: None,
                         preview: false,
                     },
                 },
@@ -440,7 +447,12 @@ pub fn download_model(
 }
 
 #[tauri::command]
-pub fn remove_model(app: AppHandle, model_id: ModelId) -> Result<(), String> {
+pub fn remove_model(
+    app: AppHandle,
+    cache: State<'_, crate::inference::ModelSessionCache>,
+    model_id: ModelId,
+) -> Result<(), String> {
+    cache.invalidate(model_id);
     let path = managed_model_path(&app, model_id)?;
     if path.exists() {
         std::fs::remove_file(&path).map_err(|error| format!("Could not remove model: {error}"))?;

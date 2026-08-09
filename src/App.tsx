@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } f
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { ArrowRight, Brush, Check, CircleHelp, Download, Eraser, FileImage, Film, FolderOpen, Image as ImageIcon, Layers3, Moon, Pause, Play, RotateCcw, Settings2, Trash2, Undo2, UploadCloud, WandSparkles, X, Zap } from "lucide-react";
+import { ArrowRight, Brush, Check, CircleHelp, Download, Eraser, FileImage, Film, FolderOpen, Image as ImageIcon, Layers3, Moon, Pause, RotateCcw, Settings2, Trash2, Undo2, UploadCloud, WandSparkles, X, Zap } from "lucide-react";
 
 type MediaKind = "image" | "video";
 type Quality = "Fast" | "Balanced" | "Maximum";
@@ -14,13 +14,12 @@ type CorrectionMode = "restore" | "erase";
 
 interface ImportedMedia { file?: File; path?: string; name: string; size: number; kind: MediaKind; url: string; }
 interface NativeMediaInfo { path: string; name: string; size: number; kind: MediaKind; previewDataUrl?: string; }
-interface ProcessResult { outputPath: string; model: string; provider: string; durationMs: number; frameCount?: number; preview: boolean; }
+interface ProcessResult { outputPath: string; model: string; provider: string; durationMs: number; frameCount?: number; width?: number; height?: number; frameRate?: number; mediaDurationSeconds?: number; hasAudio?: boolean; preview: boolean; }
 interface ModelStatus { id: ModelId; name: string; size: number; installed: boolean; managed: boolean; state: string; provider: string; }
 interface BootstrapStatus { ready: boolean; provider: string; models: ModelStatus[]; }
 interface JobProgress { phase: string; completed?: number; total?: number; percent?: number; etaSeconds?: number; message: string; }
 interface CorrectionPoint { x: number; y: number; }
 interface CorrectionStroke { mode: CorrectionMode; radius: number; points: CorrectionPoint[]; }
-interface VideoCorrectionStroke extends CorrectionStroke { timeSeconds: number; }
 type JobEvent =
   | ({ jobId: string; type: "progress" } & JobProgress)
   | { jobId: string; type: "completed"; result: ProcessResult }
@@ -55,8 +54,6 @@ function App() {
   const [correctionMode, setCorrectionMode] = useState<CorrectionMode>("restore");
   const [brushRadius, setBrushRadius] = useState(0.025);
   const [correctionStrokes, setCorrectionStrokes] = useState<CorrectionStroke[]>([]);
-  const [videoCorrectionStrokes, setVideoCorrectionStrokes] = useState<VideoCorrectionStroke[]>([]);
-  const [videoCorrectionTime, setVideoCorrectionTime] = useState(0);
   const [applyingCorrections, setApplyingCorrections] = useState(false);
 
   const refreshBootstrap = async () => {
@@ -77,7 +74,7 @@ function App() {
       if (payload.type === "failed") { setStatus((current) => current === "idle" ? "idle" : "ready"); setError(payload.error); return; }
       if (payload.type === "cancelled") { setStatus((current) => current === "idle" ? "idle" : "ready"); return; }
       if (!payload.result.outputPath) { void refreshBootstrap(); return; }
-      if (payload.result.preview) setPreviewResult(payload.result); else { setFullResult(payload.result); setCorrectionOpen(false); setCorrectionStrokes([]); setVideoCorrectionStrokes([]); }
+      if (payload.result.preview) setPreviewResult(payload.result); else { setFullResult(payload.result); setCorrectionOpen(false); setCorrectionStrokes([]); }
       setPreviewMode("output");
       setStatus("done");
     }).then((cleanup) => { unlisten = cleanup; });
@@ -87,7 +84,7 @@ function App() {
   const discard = (result: ProcessResult | null) => {
     if (result?.outputPath && isTauriRuntime()) void invoke("discard_output", { path: result.outputPath }).catch(() => undefined);
   };
-  const clearResults = () => { discard(fullResult); discard(previewResult); setFullResult(null); setPreviewResult(null); setPreviewMode("input"); setSavedPath(null); setCorrectionOpen(false); setCorrectionStrokes([]); setVideoCorrectionStrokes([]); };
+  const clearResults = () => { discard(fullResult); discard(previewResult); setFullResult(null); setPreviewResult(null); setPreviewMode("input"); setSavedPath(null); setCorrectionOpen(false); setCorrectionStrokes([]); };
 
   const acceptFile = (file?: File) => {
     if (!file) return;
@@ -131,7 +128,7 @@ function App() {
     catch (caught) { setError(String(caught)); }
   };
 
-  const runJob = async (fastPreview = false, corrections: VideoCorrectionStroke[] = []) => {
+  const runJob = async (fastPreview = false) => {
     if (!media || status === "processing") return;
     const needed = requiredModel(fastPreview);
     if (needed && !needed.installed) { setError(`${needed.name} must be downloaded first.`); setShowModels(true); return; }
@@ -143,7 +140,7 @@ function App() {
       const command = media.kind === "image" ? "start_image_job" : "start_video_job";
       const id = await invoke<string>(command, {
         inputPath: media.path, model, quality, edgeDetail,
-        ...(media.kind === "video" ? { screenColor, preview: fastPreview, startSeconds: fastPreview ? playheadRef.current : 0, corrections } : {}),
+        ...(media.kind === "video" ? { screenColor, preview: fastPreview, startSeconds: fastPreview ? playheadRef.current : 0 } : {}),
       });
       setActiveJobId(id);
     } catch (caught) { setStatus("ready"); setProgress(null); setError(String(caught)); }
@@ -175,13 +172,6 @@ function App() {
     finally { setApplyingCorrections(false); }
   };
 
-  const applyVideoCorrections = async () => {
-    if (videoCorrectionStrokes.length === 0 || applyingCorrections) return;
-    setApplyingCorrections(true);
-    await runJob(false, videoCorrectionStrokes);
-    setApplyingCorrections(false);
-  };
-
   const displayResult = previewResult ?? fullResult;
   const previewSource = previewMode === "output" && displayResult ? convertFileSrc(displayResult.outputPath) : media?.url ?? "";
   const processingDisabled = !bootstrap?.ready || status === "processing" || !!(requiredModel() && !requiredModel()?.installed);
@@ -197,111 +187,24 @@ function App() {
       <input ref={inputRef} className="visually-hidden" type="file" accept="image/png,image/jpeg,image/webp,video/mp4,video/quicktime,video/webm" onChange={(event) => acceptFile(event.target.files?.[0])} />
       {showModels && <section className="model-manager panel"><div className="model-manager-heading"><div><p>LOCAL MODELS</p><h2>Model manager</h2><small>{bootstrap?.provider}</small></div><button className="icon-button" onClick={() => setShowModels(false)}><X size={17} /></button></div><div className="model-list">{bootstrap?.models.map((item) => <div className="model-row" key={item.id}><div><strong>{item.name}</strong><small>{formatBytes(item.size)} · {item.provider} · {item.state === "local" ? "Local test model" : item.installed ? "Ready" : item.state === "partial" ? "Resume available" : "Not installed"}</small></div><span className={`model-state ${item.installed ? "ready" : ""}`}>{item.state === "local" ? "Local" : item.installed ? "Ready" : item.state === "partial" ? "Partial" : "Optional"}</span>{item.installed && item.managed ? <><button onClick={() => downloadModel(item.id)} disabled={!!activeJobId}><RotateCcw size={14} /> Redownload</button><button className="remove-model" onClick={() => removeModel(item.id)} disabled={!!activeJobId}><Trash2 size={14} /></button></> : !item.installed ? <button onClick={() => downloadModel(item.id)} disabled={!!activeJobId}><Download size={14} /> {item.state === "partial" ? "Resume" : "Download"}</button> : <span className="local-model-note">Development</span>}</div>)}</div>{activeJobId && progress && <><ProgressView progress={progress} /><button className="reset-button danger" onClick={cancelJob}>Cancel</button></>}</section>}
       <section className="intro-row"><h1>Cut out the subject.<br /><span>Keep every detail.</span></h1><p className="intro-copy">Turn images into transparent PNGs and videos into clean green or blue screen footage—entirely on your device.</p></section>
-      {media && correctionOpen && fullResult ? <section className="editor-grid correction-grid"><div className="preview-panel panel"><div className="panel-heading"><div><span className="media-badge"><Brush size={14} /></span><h2>Manual correction</h2><p>{media.name} · {media.kind === "video" ? `keyframe at ${videoCorrectionTime.toFixed(2)}s` : "draw directly on the mask"}</p></div><button className="icon-button" aria-label="Close correction editor" onClick={() => { setCorrectionOpen(false); setCorrectionStrokes([]); setVideoCorrectionStrokes([]); }}><X size={18} /></button></div><div className={`media-stage correction-stage ${media.kind === "image" ? "checkerboard" : "video-correction-stage"}`}>{media.kind === "image" ? <CorrectionCanvas inputSource={media.url} outputSource={convertFileSrc(fullResult.outputPath)} mode={correctionMode} radius={brushRadius} strokes={correctionStrokes} onChange={setCorrectionStrokes} /> : <VideoCorrectionCanvas inputSource={media.url} mode={correctionMode} radius={brushRadius} strokes={videoCorrectionStrokes} time={videoCorrectionTime} onTimeChange={(value) => { setVideoCorrectionTime(value); playheadRef.current = value; }} onChange={setVideoCorrectionStrokes} />}</div></div><aside className="controls-panel panel correction-controls"><div className="controls-title"><div><p>{media.kind === "video" ? "KEYFRAME EDITOR" : "MASK EDITOR"}</p><h2>Refine the cutout</h2></div><Brush size={19} /></div><label className="control-group"><span>Brush mode</span><div className="segmented correction-modes"><button className={correctionMode === "restore" ? "active" : ""} onClick={() => setCorrectionMode("restore")}><Brush size={14} /> Restore</button><button className={correctionMode === "erase" ? "active" : ""} onClick={() => setCorrectionMode("erase")}><Eraser size={14} /> Erase</button></div><small>{media.kind === "video" ? "Pause on a frame, then paint. Each stroke propagates for half a second around its keyframe." : "Restore brings original pixels back. Erase makes unwanted areas transparent."}</small></label><label className="control-group range-group"><span><b>Brush size</b><output>{Math.round(brushRadius * 200)}%</output></span><input type="range" min="0.005" max="0.08" step="0.005" value={brushRadius} onChange={(event) => setBrushRadius(Number(event.target.value))} /></label><div className="correction-summary"><strong>{media.kind === "video" ? videoCorrectionStrokes.length : correctionStrokes.length}</strong><span>{(media.kind === "video" ? videoCorrectionStrokes.length : correctionStrokes.length) === 1 ? "brush stroke" : "brush strokes"}</span></div><button className="process-button" disabled={(media.kind === "video" ? videoCorrectionStrokes.length : correctionStrokes.length) === 0 || applyingCorrections} onClick={media.kind === "video" ? applyVideoCorrections : applyCorrections}>{applyingCorrections ? <><span className="mini-spinner" /> Applying…</> : <><Check size={18} /> {media.kind === "video" ? "Reprocess with corrections" : "Apply corrections"}</>}</button><button className="reset-button" disabled={(media.kind === "video" ? videoCorrectionStrokes.length : correctionStrokes.length) === 0} onClick={() => media.kind === "video" ? setVideoCorrectionStrokes((current) => current.slice(0, -1)) : setCorrectionStrokes((current) => current.slice(0, -1))}><Undo2 size={14} /> Undo last stroke</button><button className="reset-button" disabled={(media.kind === "video" ? videoCorrectionStrokes.length : correctionStrokes.length) === 0} onClick={() => media.kind === "video" ? setVideoCorrectionStrokes([]) : setCorrectionStrokes([])}><RotateCcw size={14} /> Clear brushwork</button><button className="reset-button" onClick={() => { setCorrectionOpen(false); setCorrectionStrokes([]); setVideoCorrectionStrokes([]); }}><X size={14} /> Cancel</button></aside></section> : !media ? <section className={`drop-zone ${dragging ? "is-dragging" : ""}`} onDragEnter={(event) => { event.preventDefault(); setDragging(true); }} onDragOver={(event) => event.preventDefault()} onDragLeave={(event) => { event.preventDefault(); setDragging(false); }} onDrop={(event) => { event.preventDefault(); setDragging(false); acceptFile(event.dataTransfer.files[0]); }}><div className="drop-glow" /><span className="upload-icon"><UploadCloud size={30} /></span><h2>Drop an image or video here</h2><p>or choose a file from your computer</p><button className="primary-button" onClick={browseFiles}><FolderOpen size={17} /> Browse files</button><div className="format-row"><span><FileImage size={14} /> PNG, JPG, WEBP</span><i /><span><Film size={14} /> MP4, MOV, WEBM</span></div></section> :
+      {media?.kind === "image" && correctionOpen && fullResult ? <section className="editor-grid correction-grid"><div className="preview-panel panel"><div className="panel-heading"><div><span className="media-badge"><Brush size={14} /></span><h2>Manual correction</h2><p>{media.name} · draw directly on the mask</p></div><button className="icon-button" aria-label="Close correction editor" onClick={() => { setCorrectionOpen(false); setCorrectionStrokes([]); }}><X size={18} /></button></div><div className="media-stage correction-stage checkerboard"><CorrectionCanvas inputSource={media.url} outputSource={convertFileSrc(fullResult.outputPath)} mode={correctionMode} radius={brushRadius} strokes={correctionStrokes} onChange={setCorrectionStrokes} /></div></div><aside className="controls-panel panel correction-controls"><div className="controls-title"><div><p>MASK EDITOR</p><h2>Refine the cutout</h2></div><Brush size={19} /></div><label className="control-group"><span>Brush mode</span><div className="segmented correction-modes"><button className={correctionMode === "restore" ? "active" : ""} onClick={() => setCorrectionMode("restore")}><Brush size={14} /> Restore</button><button className={correctionMode === "erase" ? "active" : ""} onClick={() => setCorrectionMode("erase")}><Eraser size={14} /> Erase</button></div><small>Restore brings original pixels back. Erase makes unwanted areas transparent.</small></label><label className="control-group range-group"><span><b>Brush size</b><output>{Math.round(brushRadius * 200)}%</output></span><input type="range" min="0.005" max="0.08" step="0.005" value={brushRadius} onChange={(event) => setBrushRadius(Number(event.target.value))} /></label><div className="correction-summary"><strong>{correctionStrokes.length}</strong><span>{correctionStrokes.length === 1 ? "brush stroke" : "brush strokes"}</span></div><button className="process-button" disabled={correctionStrokes.length === 0 || applyingCorrections} onClick={applyCorrections}>{applyingCorrections ? <><span className="mini-spinner" /> Applying…</> : <><Check size={18} /> Apply corrections</>}</button><button className="reset-button" disabled={correctionStrokes.length === 0} onClick={() => setCorrectionStrokes((current) => current.slice(0, -1))}><Undo2 size={14} /> Undo last stroke</button><button className="reset-button" disabled={correctionStrokes.length === 0} onClick={() => setCorrectionStrokes([])}><RotateCcw size={14} /> Clear brushwork</button><button className="reset-button" onClick={() => { setCorrectionOpen(false); setCorrectionStrokes([]); }}><X size={14} /> Cancel</button></aside></section> : !media ? <section className={`drop-zone ${dragging ? "is-dragging" : ""}`} onDragEnter={(event) => { event.preventDefault(); setDragging(true); }} onDragOver={(event) => event.preventDefault()} onDragLeave={(event) => { event.preventDefault(); setDragging(false); }} onDrop={(event) => { event.preventDefault(); setDragging(false); acceptFile(event.dataTransfer.files[0]); }}><div className="drop-glow" /><span className="upload-icon"><UploadCloud size={30} /></span><h2>Drop an image or video here</h2><p>or choose a file from your computer</p><button className="primary-button" onClick={browseFiles}><FolderOpen size={17} /> Browse files</button><div className="format-row"><span><FileImage size={14} /> PNG, JPG, WEBP</span><i /><span><Film size={14} /> MP4, MOV, WEBM</span></div></section> :
       <section className="editor-grid"><div className="preview-panel panel"><div className="panel-heading"><div><span className="media-badge">{media.kind === "image" ? <ImageIcon size={14} /> : <Film size={14} />}</span><h2>{media.name}</h2><p>{formatBytes(media.size)} · {status === "done" ? "Result ready" : "Ready to process"}</p></div><div className="preview-actions"><div className="preview-toggle"><button className={previewMode === "input" ? "active" : ""} onClick={() => setPreviewMode("input")}>Input</button><button className={previewMode === "output" ? "active" : ""} onClick={() => setPreviewMode("output")} disabled={!displayResult}>Output</button></div><button className="icon-button" onClick={reset}><X size={18} /></button></div></div>
         <div className={`media-stage ${media.kind === "image" ? "checkerboard" : previewMode === "output" ? `screen-${screenColor}` : ""}`}>{media.kind === "image" ? <img src={previewSource} alt={previewMode === "output" ? "Background removed" : "Input"} /> : <video key={previewSource} src={previewSource} controls preload="metadata" onTimeUpdate={(event) => { if (previewMode === "input") { playheadRef.current = event.currentTarget.currentTime; setPlayhead(event.currentTarget.currentTime); } }} />}{status === "processing" && <div className="processing-overlay"><span className="spinner" /><strong>{progress?.message ?? "Preparing the cutout"}</strong>{progress && <ProgressView progress={progress} />}{activeJobId && <button className="cancel-overlay" onClick={cancelJob}><Pause size={14} /> Cancel</button>}</div>}{status === "done" && previewMode === "output" && <div className="done-badge"><Check size={15} /> {displayResult?.preview ? "1-second preview" : media.kind === "image" ? "Background removed" : "Full export"}</div>}</div></div>
         <aside className="controls-panel panel"><div className="controls-title"><div><p>OUTPUT SETTINGS</p><h2>Configure cutout</h2></div><Settings2 size={19} /></div>
           <label className="control-group"><span>Detection model</span><div className="segmented three">{(["Auto", "General", "Anime"] as Model[]).map((item) => <button key={item} className={model === item ? "active" : ""} onClick={() => setModel(item)}>{item}</button>)}</div><small>{model === "Auto" ? "Analyzes the media locally and routes confidently stylized content to Anime when installed." : model === "Anime" ? "Optimized for line art and stylized edges." : "General handles people, animals, products and objects."}</small></label>
-          {media.kind === "video" && <label className="control-group"><span>Screen colour</span><div className="color-options"><button className={screenColor === "green" ? "selected" : ""} onClick={() => setScreenColor("green")}><i className="green-swatch" /><span>Green</span>{screenColor === "green" && <Check size={14} />}</button><button className={screenColor === "blue" ? "selected" : ""} onClick={() => setScreenColor("blue")}><i className="blue-swatch" /><span>Blue</span>{screenColor === "blue" && <Check size={14} />}</button></div><small>Motion-aware stabilization reduces mask flicker and resets at scene cuts.</small></label>}
+          {media.kind === "video" && <label className="control-group"><span>Screen colour</span><div className="color-options"><button className={screenColor === "green" ? "selected" : ""} onClick={() => setScreenColor("green")}><i className="green-swatch" /><span>Green</span>{screenColor === "green" && <Check size={14} />}</button><button className={screenColor === "blue" ? "selected" : ""} onClick={() => setScreenColor("blue")}><i className="blue-swatch" /><span>Blue</span>{screenColor === "blue" && <Check size={14} />}</button></div><small>Motion-aware stabilization reduces mask flicker. Exports normalize rotation, frame timing, and audio sync.</small></label>}
           <label className="control-group"><span>Quality</span><div className="quality-select"><Zap size={16} /><select value={quality} onChange={(event) => setQuality(event.target.value as Quality)}><option>Fast</option><option>Balanced</option><option>Maximum</option></select></div><small>{quality === "Fast" ? `General Lite · quicker mask resampling${media.kind === "video" ? " · faster encoding" : ""}.` : quality === "Balanced" ? `General Lite · detailed mask resampling${media.kind === "video" ? " · balanced encoding" : ""}.` : `General Maximum · highest detail${media.kind === "video" ? " · slower high-quality encoding" : ""}.`}</small>{requiredModel() && !requiredModel()?.installed && <small className="download-needed">{requiredModel()?.name} needs to be downloaded. <button onClick={() => setShowModels(true)}>Open models</button></small>}</label>
           <label className="control-group range-group"><span><b>Edge detail</b><output>{edgeDetail}%</output></span><input type="range" min="0" max="100" value={edgeDetail} onChange={(event) => setEdgeDetail(Number(event.target.value))} /><small>Preserves fine hair, fur and soft edges.</small></label>
           <div className="export-card"><span>{media.kind === "image" ? <FileImage size={20} /> : <Film size={20} />}</span><div><small>EXPORT FORMAT</small><strong>{media.kind === "image" ? "Transparent PNG" : `${screenColor === "green" ? "Green" : "Blue"} screen MP4`}</strong></div><Check size={16} /></div>
           {media.kind === "video" && <button className="preview-button" onClick={() => runJob(true)} disabled={status === "processing" || !!(requiredModel(true) && !requiredModel(true)?.installed)}><Film size={17} /> Preview 1 second from {Math.floor(playhead)}s</button>}
           {media.kind === "image" && fullResult && <button className="preview-button correction-button" onClick={() => { setCorrectionStrokes([]); setCorrectionOpen(true); }}><Brush size={17} /> Correct mask manually</button>}
-          {media.kind === "video" && fullResult && <button className="preview-button correction-button" onClick={() => { setVideoCorrectionStrokes([]); setVideoCorrectionTime(0); setCorrectionOpen(true); }}><Brush size={17} /> Correct video keyframes</button>}
           <button className="process-button" onClick={fullResult ? saveResult : () => runJob(false)} disabled={processingDisabled}>{fullResult ? <><Download size={18} />{savedPath ? "Save another copy" : `Save ${media.kind === "image" ? "PNG" : "full MP4"}`}</> : status === "processing" ? <><span className="mini-spinner" /> Processing…</> : <><WandSparkles size={18} /> {media.kind === "video" ? "Process full video" : "Remove background"}<ArrowRight size={17} /></>}</button>
-          {displayResult && <p className="result-note">{displayResult.preview ? "Temporary preview" : "Full result"} · {displayResult.model} · {(displayResult.durationMs / 1000).toFixed(1)}s · {displayResult.provider.replace("ExecutionProvider", "")}{displayResult.frameCount ? ` · ${displayResult.frameCount} frames` : ""}</p>}
+          {displayResult && <p className="result-note">{displayResult.preview ? "Temporary preview" : "Full result"} · {displayResult.model} · processed in {(displayResult.durationMs / 1000).toFixed(1)}s · {displayResult.provider.replace("ExecutionProvider", "")}{displayResult.width && displayResult.height ? ` · ${displayResult.width}×${displayResult.height}` : ""}{displayResult.frameRate ? ` · ${displayResult.frameRate.toFixed(2)} fps` : ""}{displayResult.mediaDurationSeconds != null ? ` · ${displayResult.mediaDurationSeconds.toFixed(2)}s media` : ""}{displayResult.frameCount ? ` · ${displayResult.frameCount} frames` : ""}{media.kind === "video" && displayResult.hasAudio != null ? displayResult.hasAudio ? " · audio" : " · silent" : ""}</p>}
           {fullResult && <button className="reset-button" onClick={() => runJob(false)}><WandSparkles size={14} /> Process again</button>}<button className="reset-button" onClick={reset}><RotateCcw size={14} /> Choose another file</button>
         </aside></section>}
       {error && <div className="error-toast"><X size={15} /> {error}<button onClick={() => setError(null)}><X size={13} /></button></div>}
     </main>
   </div>;
-}
-
-function VideoCorrectionCanvas({ inputSource, mode, radius, strokes, time, onTimeChange, onChange }: { inputSource: string; mode: CorrectionMode; radius: number; strokes: VideoCorrectionStroke[]; time: number; onTimeChange: (time: number) => void; onChange: (strokes: VideoCorrectionStroke[]) => void; }) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const activePointer = useRef<number | null>(null);
-  const activeStroke = useRef<VideoCorrectionStroke | null>(null);
-  const baseStrokes = useRef<VideoCorrectionStroke[]>([]);
-  const [duration, setDuration] = useState(0);
-  const [playing, setPlaying] = useState(false);
-
-  useEffect(() => {
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    if (!video || !canvas || !video.videoWidth || !video.videoHeight) return;
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const context = canvas.getContext("2d");
-    if (!context) return;
-    context.clearRect(0, 0, canvas.width, canvas.height);
-    for (const stroke of strokes) {
-      const distance = Math.abs(stroke.timeSeconds - time);
-      if (distance <= 0.5) paintVideoCorrectionStroke(context, stroke, canvas.width, canvas.height, Math.max(0.2, 1 - distance / 0.5));
-    }
-  }, [strokes, time]);
-
-  const pointFromEvent = (event: ReactPointerEvent<HTMLCanvasElement>): CorrectionPoint => {
-    const bounds = event.currentTarget.getBoundingClientRect();
-    return {
-      x: Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)),
-      y: Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height)),
-    };
-  };
-  const startStroke = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    event.preventDefault();
-    const video = videoRef.current;
-    video?.pause(); setPlaying(false);
-    const timeSeconds = video?.currentTime ?? time;
-    event.currentTarget.setPointerCapture(event.pointerId);
-    activePointer.current = event.pointerId;
-    baseStrokes.current = strokes;
-    activeStroke.current = { mode, radius, timeSeconds, points: [pointFromEvent(event)] };
-    onChange([...baseStrokes.current, activeStroke.current]);
-  };
-  const continueStroke = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (activePointer.current !== event.pointerId || !activeStroke.current) return;
-    event.preventDefault();
-    const point = pointFromEvent(event);
-    const previous = activeStroke.current.points.at(-1);
-    if (previous && Math.hypot(point.x - previous.x, point.y - previous.y) < 0.0015) return;
-    activeStroke.current = { ...activeStroke.current, points: [...activeStroke.current.points, point] };
-    onChange([...baseStrokes.current, activeStroke.current]);
-  };
-  const finishStroke = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (activePointer.current !== event.pointerId) return;
-    activePointer.current = null; activeStroke.current = null;
-  };
-  const seek = (value: number) => {
-    if (videoRef.current) videoRef.current.currentTime = value;
-    onTimeChange(value);
-  };
-  const togglePlayback = () => {
-    const video = videoRef.current;
-    if (!video) return;
-    if (video.paused) void video.play(); else video.pause();
-  };
-
-  return <div className="video-keyframe-editor"><div className="video-correction-surface"><video ref={videoRef} src={inputSource} preload="metadata" onLoadedMetadata={(event) => { setDuration(event.currentTarget.duration); seek(Math.min(time, event.currentTarget.duration || 0)); }} onTimeUpdate={(event) => onTimeChange(event.currentTarget.currentTime)} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} /><canvas ref={canvasRef} className={`video-correction-canvas mode-${mode}`} aria-label="Video mask correction canvas" onPointerDown={startStroke} onPointerMove={continueStroke} onPointerUp={finishStroke} onPointerCancel={finishStroke} /></div><div className="video-correction-timeline"><button type="button" aria-label={playing ? "Pause" : "Play"} onClick={togglePlayback}>{playing ? <Pause size={15} /> : <Play size={15} />}</button><input aria-label="Correction playhead" type="range" min="0" max={Math.max(duration, 0.01)} step="0.01" value={Math.min(time, Math.max(duration, 0.01))} onChange={(event) => seek(Number(event.target.value))} /><output>{time.toFixed(2)}s / {duration.toFixed(2)}s</output></div></div>;
-}
-
-function paintVideoCorrectionStroke(context: CanvasRenderingContext2D, stroke: VideoCorrectionStroke, width: number, height: number, opacity: number) {
-  if (stroke.points.length === 0) return;
-  const brush = stroke.radius * Math.min(width, height);
-  context.save();
-  context.globalAlpha = opacity;
-  context.strokeStyle = stroke.mode === "restore" ? "#b7f34a" : "#ff6b66";
-  context.fillStyle = context.strokeStyle;
-  context.lineCap = "round"; context.lineJoin = "round"; context.lineWidth = brush * 2;
-  if (stroke.points.length === 1) {
-    context.beginPath(); context.arc(stroke.points[0].x * width, stroke.points[0].y * height, brush, 0, Math.PI * 2); context.fill();
-  } else {
-    context.beginPath();
-    stroke.points.forEach((point, index) => index === 0 ? context.moveTo(point.x * width, point.y * height) : context.lineTo(point.x * width, point.y * height));
-    context.stroke();
-  }
-  context.restore();
 }
 
 function CorrectionCanvas({ inputSource, outputSource, mode, radius, strokes, onChange }: { inputSource: string; outputSource: string; mode: CorrectionMode; radius: number; strokes: CorrectionStroke[]; onChange: (strokes: CorrectionStroke[]) => void; }) {

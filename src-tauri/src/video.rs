@@ -1,5 +1,4 @@
 use crate::{
-    corrections::{apply_video_corrections, VideoCorrectionStroke},
     inference::{composite_screen, Masker},
     jobs::{emit_progress, JobControl},
     models::ModelId,
@@ -33,6 +32,22 @@ struct ProbeStream {
     r_frame_rate: Option<String>,
     duration: Option<String>,
     nb_frames: Option<String>,
+    sample_aspect_ratio: Option<String>,
+    tags: Option<ProbeTags>,
+    side_data_list: Option<Vec<ProbeSideData>>,
+    disposition: Option<ProbeDisposition>,
+}
+#[derive(Deserialize)]
+struct ProbeTags {
+    rotate: Option<String>,
+}
+#[derive(Deserialize)]
+struct ProbeSideData {
+    rotation: Option<f64>,
+}
+#[derive(Deserialize)]
+struct ProbeDisposition {
+    attached_pic: Option<u8>,
 }
 #[derive(Deserialize)]
 struct ProbeFormat {
@@ -45,6 +60,7 @@ struct VideoMeta {
     fps_arg: String,
     duration: f64,
     frames: u64,
+    has_audio: bool,
 }
 
 fn developer_binary(name: &str) -> PathBuf {
@@ -98,10 +114,49 @@ pub fn routing_sample(app: &AppHandle, input: &Path) -> Result<DynamicImage, Str
 }
 
 fn parse_rate(rate: &str) -> Option<f64> {
-    let (a, b) = rate.split_once('/')?;
+    let (a, b) = rate.split_once('/').or_else(|| rate.split_once(':'))?;
     let numerator: f64 = a.parse().ok()?;
     let denominator: f64 = b.parse().ok()?;
-    (denominator > 0.0).then_some(numerator / denominator)
+    let value = numerator / denominator;
+    (denominator > 0.0 && value.is_finite() && (0.1..=240.0).contains(&value)).then_some(value)
+}
+
+fn select_frame_rate(average: Option<&str>, nominal: Option<&str>) -> (String, f64) {
+    for candidate in [average, nominal].into_iter().flatten() {
+        if let Some(value) = parse_rate(candidate) {
+            return (candidate.to_string(), value);
+        }
+    }
+    ("30/1".into(), 30.0)
+}
+
+fn parse_aspect_ratio(value: Option<&str>) -> f64 {
+    value.and_then(parse_rate).unwrap_or(1.0)
+}
+
+fn normalized_rotation(video: &ProbeStream) -> i32 {
+    let raw = video
+        .side_data_list
+        .as_deref()
+        .and_then(|items| items.iter().find_map(|item| item.rotation))
+        .or_else(|| video.tags.as_ref()?.rotate.as_deref()?.parse().ok())
+        .unwrap_or(0.0);
+    let rounded = (raw / 90.0).round() as i32 * 90;
+    ((rounded % 360) + 360) % 360
+}
+
+fn even(value: f64) -> u32 {
+    ((value.round().max(2.0) as u32) / 2) * 2
+}
+
+fn normalized_dimensions(width: u32, height: u32, sample_aspect: f64, rotation: i32) -> (u32, u32) {
+    let square_width = even(width as f64 * sample_aspect);
+    let square_height = even(height as f64);
+    if matches!(rotation, 90 | 270) {
+        (square_height, square_width)
+    } else {
+        (square_width, square_height)
+    }
 }
 
 fn encoding_profile(quality: QualityMode) -> (&'static str, &'static str) {
@@ -136,41 +191,64 @@ fn probe(ffprobe: &Path, source: &Path) -> Result<VideoMeta, String> {
     let video = value
         .streams
         .iter()
-        .find(|stream| stream.codec_type.as_deref() == Some("video"))
+        .find(|stream| {
+            stream.codec_type.as_deref() == Some("video")
+                && stream
+                    .disposition
+                    .as_ref()
+                    .and_then(|value| value.attached_pic)
+                    != Some(1)
+        })
         .ok_or("The file has no video stream")?;
-    let width = video.width.ok_or("Video width is unavailable")?;
-    let height = video.height.ok_or("Video height is unavailable")?;
-    let fps_arg = video
-        .avg_frame_rate
-        .as_deref()
-        .filter(|v| *v != "0/0")
-        .or(video.r_frame_rate.as_deref())
-        .unwrap_or("30/1")
-        .to_string();
-    let fps = parse_rate(&fps_arg).unwrap_or(30.0);
-    let duration = video
+    let coded_width = video.width.ok_or("Video width is unavailable")?;
+    let coded_height = video.height.ok_or("Video height is unavailable")?;
+    let rotation = normalized_rotation(video);
+    let (width, height) = normalized_dimensions(
+        coded_width,
+        coded_height,
+        parse_aspect_ratio(video.sample_aspect_ratio.as_deref()),
+        rotation,
+    );
+    let (fps_arg, fps) = select_frame_rate(
+        video.avg_frame_rate.as_deref(),
+        video.r_frame_rate.as_deref(),
+    );
+    let stream_duration = video
         .duration
         .as_deref()
-        .and_then(|v| v.parse().ok())
-        .or_else(|| value.format.as_ref()?.duration.as_deref()?.parse().ok())
-        .unwrap_or(0.0);
-    let frames = video
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0);
+    let reported_frames = video
         .nb_frames
         .as_deref()
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| (duration * fps).ceil() as u64);
+        .unwrap_or(0_u64);
+    let format_duration = value
+        .format
+        .as_ref()
+        .and_then(|format| format.duration.as_deref())
+        .and_then(|duration| duration.parse::<f64>().ok())
+        .filter(|duration| duration.is_finite() && *duration > 0.0);
+    let duration = stream_duration
+        .or_else(|| (reported_frames > 0).then_some(reported_frames as f64 / fps))
+        .or(format_duration)
+        .ok_or("Video duration is unavailable")?;
+    let frames = (duration * fps).round().max(1.0) as u64;
     Ok(VideoMeta {
         width,
         height,
         fps_arg,
         duration,
         frames,
+        has_audio: value
+            .streams
+            .iter()
+            .any(|stream| stream.codec_type.as_deref() == Some("audio")),
     })
 }
 
 fn preview_dimensions(width: u32, height: u32) -> (u32, u32) {
     let scale = (1280.0 / width as f64).min(720.0 / height as f64).min(1.0);
-    let even = |value: f64| (((value.floor() as u32).max(2)) / 2) * 2;
     (even(width as f64 * scale), even(height as f64 * scale))
 }
 
@@ -179,9 +257,52 @@ fn kill(child: &mut Child) {
     let _ = child.wait();
 }
 
+fn child_error(child: &mut Child) -> String {
+    let mut message = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_string(&mut message);
+    }
+    message.trim().chars().take(1200).collect()
+}
+
+fn validate_export(
+    ffprobe: &Path,
+    output: &Path,
+    expected_width: u32,
+    expected_height: u32,
+    expected_duration: f64,
+    expected_audio: bool,
+    fps: f64,
+) -> Result<(), String> {
+    let result = probe(ffprobe, output)
+        .map_err(|error| format!("The encoded MP4 could not be validated: {error}"))?;
+    if result.width != expected_width || result.height != expected_height {
+        return Err(format!(
+            "The encoded MP4 has unexpected dimensions ({}x{} instead of {expected_width}x{expected_height})",
+            result.width, result.height
+        ));
+    }
+    let tolerance = (0.6 / fps.max(1.0)).max(0.08);
+    if (result.duration - expected_duration).abs() > tolerance {
+        return Err(format!(
+            "The encoded MP4 duration drifted by {:.3} seconds",
+            result.duration - expected_duration
+        ));
+    }
+    if expected_audio && !result.has_audio {
+        return Err("The encoded MP4 is missing the source audio".into());
+    }
+    Ok(())
+}
+
 pub struct VideoOutcome {
     pub frame_count: u64,
     pub provider: String,
+    pub width: u32,
+    pub height: u32,
+    pub frame_rate: f64,
+    pub duration: f64,
+    pub has_audio: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -196,27 +317,54 @@ pub fn process_video(
     screen_color: &str,
     preview: bool,
     start_seconds: f64,
-    corrections: &[VideoCorrectionStroke],
 ) -> Result<VideoOutcome, String> {
     let ffmpeg = bundled_binary(app, "ffmpeg")?;
     let ffprobe = bundled_binary(app, "ffprobe")?;
     let model_path = crate::models::model_path(app, model_id)?;
-    process_video_with_paths(
-        Some(app),
-        control,
-        input,
-        output,
-        model_id,
-        &model_path,
-        &ffmpeg,
-        &ffprobe,
-        edge_detail,
-        quality,
-        screen_color,
-        preview,
-        start_seconds,
-        corrections,
-    )
+    app.state::<crate::inference::ModelSessionCache>()
+        .with_model(
+            model_path,
+            model_id,
+            model_id != ModelId::General,
+            || {
+                emit_progress(
+                    app,
+                    control,
+                    "loadingModel",
+                    None,
+                    None,
+                    None,
+                    "Loading segmentation model",
+                )
+            },
+            |masker, reused| {
+                if reused {
+                    emit_progress(
+                        app,
+                        control,
+                        "loadingModel",
+                        None,
+                        None,
+                        None,
+                        "Using loaded segmentation model",
+                    );
+                }
+                process_video_with_masker(
+                    Some(app),
+                    control,
+                    input,
+                    output,
+                    masker,
+                    &ffmpeg,
+                    &ffprobe,
+                    edge_detail,
+                    quality,
+                    screen_color,
+                    preview,
+                    start_seconds,
+                )
+            },
+        )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -234,7 +382,53 @@ pub fn process_video_with_paths(
     screen_color: &str,
     preview: bool,
     start_seconds: f64,
-    corrections: &[VideoCorrectionStroke],
+) -> Result<VideoOutcome, String> {
+    if let Some(app) = app {
+        emit_progress(
+            app,
+            control,
+            "loadingModel",
+            None,
+            None,
+            None,
+            "Loading segmentation model",
+        );
+    }
+    let mut masker = Masker::load_from_path(
+        model_path.to_path_buf(),
+        model_id,
+        model_id != ModelId::General,
+    )?;
+    process_video_with_masker(
+        app,
+        control,
+        input,
+        output,
+        &mut masker,
+        ffmpeg,
+        ffprobe,
+        edge_detail,
+        quality,
+        screen_color,
+        preview,
+        start_seconds,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_video_with_masker(
+    app: Option<&AppHandle>,
+    control: &JobControl,
+    input: &Path,
+    output: &Path,
+    masker: &mut Masker,
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    edge_detail: u8,
+    quality: &str,
+    screen_color: &str,
+    preview: bool,
+    start_seconds: f64,
 ) -> Result<VideoOutcome, String> {
     let quality_mode = QualityMode::parse(quality)?;
     let meta = probe(ffprobe, input)?;
@@ -252,30 +446,12 @@ pub fn process_video_with_paths(
         (
             width,
             height,
-            "12".to_string(),
+            "12/1".to_string(),
             (clip_duration * 12.0).ceil() as u64,
         )
     } else {
         (meta.width, meta.height, meta.fps_arg.clone(), meta.frames)
     };
-    let output_fps = parse_rate(&fps_arg).unwrap_or(30.0);
-
-    if let Some(app) = app {
-        emit_progress(
-            app,
-            control,
-            "loadingModel",
-            None,
-            None,
-            None,
-            "Loading segmentation model",
-        );
-    }
-    let mut masker = Masker::load_from_path(
-        model_path.to_path_buf(),
-        model_id,
-        model_id != ModelId::General,
-    )?;
     if control.cancelled.load(Ordering::SeqCst) {
         return Err("cancelled".into());
     }
@@ -290,12 +466,20 @@ pub fn process_video_with_paths(
         ]);
     }
     decode_args.extend(["-i".into(), input.to_string_lossy().into_owned()]);
-    if preview {
-        decode_args.extend([
-            "-vf".into(),
-            format!("fps=12,scale={width}:{height}:flags=lanczos"),
-        ]);
-    }
+    let decode_filter = if preview {
+        format!("fps=12,scale={width}:{height}:flags=lanczos,setsar=1")
+    } else {
+        format!(
+            "fps={},scale={width}:{height}:flags=lanczos,setsar=1",
+            meta.fps_arg
+        )
+    };
+    decode_args.extend([
+        "-vf".into(),
+        decode_filter,
+        "-frames:v".into(),
+        total.to_string(),
+    ]);
     decode_args.extend([
         "-an".into(),
         "-f".into(),
@@ -320,9 +504,11 @@ pub fn process_video_with_paths(
         "rawvideo".into(),
         "-pix_fmt".into(),
         "rgb24".into(),
+        "-fflags".into(),
+        "+genpts".into(),
         "-s".into(),
         format!("{width}x{height}"),
-        "-r".into(),
+        "-framerate".into(),
         fps_arg.clone(),
         "-i".into(),
         "pipe:0".into(),
@@ -336,13 +522,14 @@ pub fn process_video_with_paths(
         ]);
     }
     let (full_crf, full_preset) = encoding_profile(quality_mode);
+    encode_args.extend(["-i".into(), input.to_string_lossy().into_owned()]);
+    encode_args.extend(["-map".into(), "0:v:0".into()]);
+    if meta.has_audio {
+        encode_args.extend(["-map".into(), "1:a:0?".into()]);
+    } else {
+        encode_args.push("-an".into());
+    }
     encode_args.extend([
-        "-i".into(),
-        input.to_string_lossy().into_owned(),
-        "-map".into(),
-        "0:v:0".into(),
-        "-map".into(),
-        "1:a?".into(),
         "-c:v".into(),
         "libx264".into(),
         "-pix_fmt".into(),
@@ -359,11 +546,28 @@ pub fn process_video_with_paths(
         } else {
             full_preset.into()
         },
-        "-c:a".into(),
-        "aac".into(),
-        "-shortest".into(),
-        output.to_string_lossy().into_owned(),
+        "-fps_mode".into(),
+        "cfr".into(),
+        "-map_metadata".into(),
+        "-1".into(),
+        "-metadata:s:v:0".into(),
+        "rotate=0".into(),
+        "-movflags".into(),
+        "+faststart".into(),
     ]);
+    if meta.has_audio {
+        encode_args.extend([
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            "192k".into(),
+            "-af".into(),
+            format!(
+                "atrim=duration={clip_duration:.6},asetpts=PTS-STARTPTS,aresample=async=1000:first_pts=0"
+            ),
+        ]);
+    }
+    encode_args.push(output.to_string_lossy().into_owned());
     let mut encoder = Command::new(ffmpeg)
         .args(&encode_args)
         .stdin(Stdio::piped())
@@ -423,13 +627,6 @@ pub fn process_video_with_paths(
         if let Err(error) = stabilizer.apply(&bytes, &mut cutout) {
             break Err(error);
         }
-        let frame_time = start + frame_count as f64 / output_fps;
-        let Some(rgba) = cutout.as_mut_rgba8() else {
-            break Err("Video correction requires an RGBA cutout".into());
-        };
-        if let Err(error) = apply_video_corrections(rgba, corrections, frame_time) {
-            break Err(error);
-        }
         let composited = composite_screen(&cutout, screen_color);
         if let Err(error) = writer.write_all(&composited) {
             break Err(format!("Could not encode video frame: {error}"));
@@ -478,12 +675,41 @@ pub fn process_video_with_paths(
         return Err("cancelled".into());
     }
     if !decoder_status.success() || !encoder_status.success() {
+        let decoder_error = child_error(&mut decoder);
+        let encoder_error = child_error(&mut encoder);
         let _ = std::fs::remove_file(output);
-        return Err("FFmpeg could not finish the video export".into());
+        let details = [decoder_error, encoder_error]
+            .into_iter()
+            .filter(|message| !message.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(if details.is_empty() {
+            "FFmpeg could not finish the video export".into()
+        } else {
+            format!("FFmpeg could not finish the video export: {details}")
+        });
+    }
+    let output_fps = parse_rate(&fps_arg).unwrap_or(30.0);
+    if let Err(error) = validate_export(
+        ffprobe,
+        output,
+        width,
+        height,
+        clip_duration,
+        meta.has_audio,
+        output_fps,
+    ) {
+        let _ = std::fs::remove_file(output);
+        return Err(error);
     }
     Ok(VideoOutcome {
         frame_count,
         provider: masker.provider().into(),
+        width,
+        height,
+        frame_rate: output_fps,
+        duration: clip_duration,
+        has_audio: meta.has_audio,
     })
 }
 
@@ -505,6 +731,42 @@ mod tests {
     fn rational_frame_rates_are_parsed() {
         assert_eq!(parse_rate("30000/1001").unwrap().round(), 30.0);
         assert!(parse_rate("0/0").is_none());
+        assert!(parse_rate("1000/1").is_none());
+        assert_eq!(parse_aspect_ratio(Some("2:1")), 2.0);
+    }
+
+    #[test]
+    fn invalid_average_rate_falls_back_to_nominal_rate() {
+        let (argument, value) = select_frame_rate(Some("0/0"), Some("24000/1001"));
+        assert_eq!(argument, "24000/1001");
+        assert!((value - 23.976).abs() < 0.001);
+        assert_eq!(select_frame_rate(Some("bad"), None), ("30/1".into(), 30.0));
+    }
+
+    #[test]
+    fn display_dimensions_normalize_rotation_aspect_and_odd_sizes() {
+        assert_eq!(normalized_dimensions(1921, 1081, 1.0, 0), (1920, 1080));
+        assert_eq!(normalized_dimensions(320, 214, 2.0, 90), (214, 640));
+    }
+
+    #[test]
+    fn display_matrix_rotation_is_normalized() {
+        let stream = ProbeStream {
+            codec_type: Some("video".into()),
+            width: Some(1920),
+            height: Some(1080),
+            avg_frame_rate: Some("30/1".into()),
+            r_frame_rate: Some("30/1".into()),
+            duration: Some("1".into()),
+            nb_frames: Some("30".into()),
+            sample_aspect_ratio: Some("1:1".into()),
+            tags: None,
+            side_data_list: Some(vec![ProbeSideData {
+                rotation: Some(-90.0),
+            }]),
+            disposition: None,
+        };
+        assert_eq!(normalized_rotation(&stream), 270);
     }
 
     #[test]
