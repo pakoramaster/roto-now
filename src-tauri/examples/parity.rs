@@ -31,7 +31,7 @@ fn main() -> Result<(), String> {
         progress_high_water: Arc::new(AtomicU64::new(0)),
     };
     let mut masker = Masker::load_from_path(PathBuf::from(&args[2]), model_id, false)?;
-    let output = masker.apply(&source, 72, &control)?;
+    let output = masker.apply(&source, 72, "Balanced", &control)?;
     save_cutout(&output, PathBuf::from(&args[4]).as_path())?;
     println!("provider={}", masker.provider());
     Ok(())

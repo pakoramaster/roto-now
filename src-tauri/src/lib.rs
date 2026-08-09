@@ -1,6 +1,8 @@
+pub mod corrections;
 pub mod inference;
 pub mod jobs;
 pub mod models;
+pub mod routing;
 pub mod temporal;
 pub mod video;
 
@@ -82,14 +84,10 @@ fn new_managed_output(extension: &str) -> Result<PathBuf, String> {
     )))
 }
 
-fn selected_model(model: &str, quality: &str, preview: bool) -> ModelId {
-    if model.eq_ignore_ascii_case("anime") {
-        ModelId::Anime
-    } else if !preview && quality.eq_ignore_ascii_case("maximum") {
-        ModelId::General
-    } else {
-        ModelId::GeneralLite
-    }
+fn anime_installed(app: &AppHandle) -> bool {
+    models::model_path(app, ModelId::Anime)
+        .map(|path| path.is_file())
+        .unwrap_or(false)
 }
 
 fn verify_input(path: &str, kind: &str) -> Result<PathBuf, String> {
@@ -140,7 +138,17 @@ fn start_image_job(
     edge_detail: u8,
 ) -> Result<String, String> {
     let input = verify_input(&input_path, "image")?;
-    let model_id = selected_model(&model, &quality, false);
+    let quality_mode = routing::QualityMode::parse(&quality)?;
+    let source_for_routing = model
+        .eq_ignore_ascii_case("auto")
+        .then(|| image::open(&input).map_err(|error| format!("Could not open image: {error}")))
+        .transpose()?;
+    let model_id = routing::select_model(
+        &model,
+        quality_mode,
+        source_for_routing.as_ref(),
+        anime_installed(&app),
+    )?;
     let model_path = models::model_path(&app, model_id)?;
     if !model_path.is_file() {
         return Err(format!(
@@ -165,8 +173,12 @@ fn start_image_job(
             "Loading segmentation model",
         );
         let outcome = (|| {
-            let source =
-                image::open(&input).map_err(|error| format!("Could not open image: {error}"))?;
+            let source = match source_for_routing {
+                Some(source) => source,
+                None => {
+                    image::open(&input).map_err(|error| format!("Could not open image: {error}"))?
+                }
+            };
             let mut masker = Masker::load(&app_for_task, model_id, model_id != ModelId::General)?;
             emit_progress(
                 &app_for_task,
@@ -177,7 +189,7 @@ fn start_image_job(
                 None,
                 "Removing background",
             );
-            let cutout = masker.apply(&source, edge_detail, &control)?;
+            let cutout = masker.apply(&source, edge_detail, &quality, &control)?;
             save_cutout(&cutout, &output)?;
             Ok::<_, String>((
                 masker.provider().to_string(),
@@ -249,12 +261,30 @@ fn start_video_job(
     screen_color: String,
     preview: bool,
     start_seconds: Option<f64>,
+    corrections: Option<Vec<corrections::VideoCorrectionStroke>>,
 ) -> Result<String, String> {
     let input = verify_input(&input_path, "video")?;
     if !matches!(screen_color.as_str(), "green" | "blue") {
         return Err("Screen colour must be green or blue".into());
     }
-    let model_id = selected_model(&model, &quality, preview);
+    let quality_mode = routing::QualityMode::parse(&quality)?;
+    let routing_quality = if preview {
+        routing::QualityMode::Fast
+    } else {
+        quality_mode
+    };
+    let routing_sample = model
+        .eq_ignore_ascii_case("auto")
+        .then(|| video::routing_sample(&app, &input))
+        .transpose()
+        .ok()
+        .flatten();
+    let model_id = routing::select_model(
+        &model,
+        routing_quality,
+        routing_sample.as_ref(),
+        anime_installed(&app),
+    )?;
     if !models::model_path(&app, model_id)?.is_file() {
         return Err(format!(
             "{} must be downloaded before processing",
@@ -265,6 +295,7 @@ fn start_video_job(
     let control = jobs.begin()?;
     let job_id = control.id.clone();
     let app_for_task = app.clone();
+    let corrections = corrections.unwrap_or_default();
     outputs.outputs.lock().insert(output.clone(), !preview);
     tauri::async_runtime::spawn_blocking(move || {
         let started = Instant::now();
@@ -275,9 +306,11 @@ fn start_video_job(
             &output,
             model_id,
             edge_detail,
+            &quality,
             &screen_color,
             preview,
             start_seconds.unwrap_or(0.0),
+            &corrections,
         );
         match outcome {
             Ok(value) => emit(
@@ -360,6 +393,33 @@ fn save_output(
 }
 
 #[tauri::command]
+fn apply_image_corrections(
+    outputs: State<'_, OutputState>,
+    source_path: String,
+    strokes: Vec<corrections::CorrectionStroke>,
+) -> Result<String, String> {
+    let source = PathBuf::from(&source_path);
+    if outputs.outputs.lock().get(&source) != Some(&true)
+        || !source.is_file()
+        || !source.starts_with(managed_temp_root())
+        || source.extension().and_then(|value| value.to_str()) != Some("png")
+    {
+        return Err("Only a managed PNG result can be corrected".into());
+    }
+
+    let mut image = image::open(&source)
+        .map_err(|error| format!("Could not open the cutout for correction: {error}"))?
+        .to_rgba8();
+    corrections::apply_corrections(&mut image, &strokes)?;
+    let output = new_managed_output("png")?;
+    image
+        .save_with_format(&output, image::ImageFormat::Png)
+        .map_err(|error| format!("Could not save the corrected cutout: {error}"))?;
+    outputs.outputs.lock().insert(output.clone(), true);
+    Ok(output.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
 fn discard_output(outputs: State<'_, OutputState>, path: String) -> Result<(), String> {
     let output = PathBuf::from(path);
     if outputs.outputs.lock().remove(&output).is_none() {
@@ -397,6 +457,7 @@ pub fn run() {
             models::cancel_job,
             start_image_job,
             start_video_job,
+            apply_image_corrections,
             save_output,
             discard_output
         ])

@@ -120,11 +120,34 @@ input[type="range"] { width: 100%; accent-color: var(--lime); height: 4px; }
 .model-manager-heading { display: flex; align-items: center; justify-content: space-between; }.model-manager-heading p { margin: 0 0 4px; }.model-manager-heading h2 { margin: 0; font-size: 17px; }.model-manager-heading small { color: #707a72; font-size: 9px; }
 .model-list { display: grid; gap: 7px; margin-top: 14px; }.model-row { min-height: 54px; display: flex; align-items: center; gap: 8px; padding: 9px 10px; border: 1px solid #292f2a; border-radius: 9px; background: #0e110f; }.model-row > div { flex: 1; display: grid; gap: 3px; }.model-row strong { font-size: 11px; }.model-row small { color: #6f7971; font-size: 9px; }.model-row > button { height: 31px; padding: 0 10px; border: 1px solid #343b35; border-radius: 7px; background: #181d19; display: flex; align-items: center; gap: 5px; color: #bbc3bd; font-size: 9px; cursor: pointer; }.model-row > button:disabled { opacity: .4; }.model-row > button.remove-model { width: 31px; padding: 0; justify-content: center; color: #cf827d; }
 .model-state { padding: 4px 7px; border-radius: 10px; color: #8b948d; background: #202421; font-size: 8px; font-weight: 800; }.model-state.ready { color: #c6f772; background: rgba(183,243,74,.09); }
+.local-model-note { padding: 0 7px; color: #99a49c; font-size: 8px; font-weight: 700; letter-spacing: .4px; }
 .download-needed { color: #dba968 !important; }.download-needed button { border: 0; padding: 0; background: transparent; color: var(--lime); font-size: inherit; cursor: pointer; text-decoration: underline; }
 
 .job-progress { width: 100%; display: grid; gap: 6px; margin-top: 12px; }.job-progress small { color: #aab3ac; font-size: 9px; text-align: center; }.progress-track { width: 100%; height: 5px; border-radius: 5px; overflow: hidden; background: #2a302b; }.progress-track i { display: block; height: 100%; border-radius: inherit; background: var(--lime); transition: width .2s ease; }.progress-track.indeterminate i { width: 35%; animation: progress-slide 1.1s ease-in-out infinite; }
 @keyframes progress-slide { from { transform: translateX(-110%); } to { transform: translateX(310%); } }
 .processing-overlay .job-progress { width: min(310px, 72%); margin-top: 5px; }.processing-overlay .job-progress small { display: none; }.cancel-overlay { margin-top: 10px; padding: 7px 11px; border: 1px solid #505852; border-radius: 7px; background: #171a18; color: #ccd3ce; display: flex; align-items: center; gap: 5px; font-size: 9px; cursor: pointer; }
+
+.correction-grid { align-items: stretch; }
+.correction-stage { position: relative; overflow: hidden; min-height: 420px; display: flex; align-items: center; justify-content: center; }
+.correction-canvas { display: block; width: auto; height: auto; max-width: 100%; max-height: 500px; touch-action: none; user-select: none; cursor: crosshair; }
+.correction-canvas.mode-restore { cursor: cell; }
+.correction-modes { grid-template-columns: 1fr 1fr; }
+.correction-modes button { display: flex; align-items: center; justify-content: center; gap: 6px; }
+.correction-summary { margin: 18px 0 4px; padding: 12px; border: 1px solid #2d342e; border-radius: 9px; background: #0e110f; display: flex; align-items: baseline; justify-content: center; gap: 6px; }
+.correction-summary strong { color: var(--lime); font-size: 18px; }
+.correction-summary span { color: #7e8880; font-size: 9px; }
+.correction-controls .reset-button:disabled { opacity: .35; cursor: not-allowed; }
+.correction-button { border-color: rgba(183,243,74,.35); color: #d8efa9; }
+.video-correction-stage { background: #080a09; }
+.video-keyframe-editor { width: 100%; display: grid; gap: 12px; }
+.video-correction-surface { position: relative; width: 100%; display: grid; place-items: center; overflow: hidden; }
+.video-correction-surface video { display: block; width: 100%; height: auto; max-height: 455px; object-fit: contain; }
+.video-correction-canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
+.video-correction-canvas.mode-restore { cursor: cell; }
+.video-correction-timeline { display: grid; grid-template-columns: 34px 1fr auto; align-items: center; gap: 9px; width: 100%; padding: 0 10px 10px; }
+.video-correction-timeline button { width: 32px; height: 30px; border: 1px solid #394039; border-radius: 7px; display: grid; place-items: center; background: #171c18; color: #d8ded9; cursor: pointer; }
+.video-correction-timeline input { accent-color: var(--lime); }
+.video-correction-timeline output { min-width: 82px; color: #89938b; font-size: 9px; text-align: right; }
 
 @media (max-width: 880px) {
   .editor-grid { grid-template-columns: 1fr; }.preview-panel { min-height: 480px; }

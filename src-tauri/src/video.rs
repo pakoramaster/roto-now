@@ -1,7 +1,9 @@
 use crate::{
+    corrections::{apply_video_corrections, VideoCorrectionStroke},
     inference::{composite_screen, Masker},
     jobs::{emit_progress, JobControl},
     models::ModelId,
+    routing::QualityMode,
     temporal::TemporalMaskStabilizer,
 };
 use image::{DynamicImage, ImageBuffer, Rgb};
@@ -70,11 +72,44 @@ fn bundled_binary(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
     ))
 }
 
+pub fn routing_sample(app: &AppHandle, input: &Path) -> Result<DynamicImage, String> {
+    let ffmpeg = bundled_binary(app, "ffmpeg")?;
+    let output = Command::new(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(input)
+        .args([
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=192:192:force_original_aspect_ratio=decrease",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "pipe:1",
+        ])
+        .output()
+        .map_err(|error| format!("Could not sample the video for automatic routing: {error}"))?;
+    if !output.status.success() {
+        return Err("Could not sample this video for automatic routing".into());
+    }
+    image::load_from_memory(&output.stdout)
+        .map_err(|error| format!("Could not read the automatic-routing frame: {error}"))
+}
+
 fn parse_rate(rate: &str) -> Option<f64> {
     let (a, b) = rate.split_once('/')?;
     let numerator: f64 = a.parse().ok()?;
     let denominator: f64 = b.parse().ok()?;
     (denominator > 0.0).then_some(numerator / denominator)
+}
+
+fn encoding_profile(quality: QualityMode) -> (&'static str, &'static str) {
+    match quality {
+        QualityMode::Fast => ("23", "veryfast"),
+        QualityMode::Balanced => ("18", "medium"),
+        QualityMode::Maximum => ("16", "slow"),
+    }
 }
 
 fn probe(ffprobe: &Path, source: &Path) -> Result<VideoMeta, String> {
@@ -157,9 +192,11 @@ pub fn process_video(
     output: &Path,
     model_id: ModelId,
     edge_detail: u8,
+    quality: &str,
     screen_color: &str,
     preview: bool,
     start_seconds: f64,
+    corrections: &[VideoCorrectionStroke],
 ) -> Result<VideoOutcome, String> {
     let ffmpeg = bundled_binary(app, "ffmpeg")?;
     let ffprobe = bundled_binary(app, "ffprobe")?;
@@ -174,9 +211,11 @@ pub fn process_video(
         &ffmpeg,
         &ffprobe,
         edge_detail,
+        quality,
         screen_color,
         preview,
         start_seconds,
+        corrections,
     )
 }
 
@@ -191,10 +230,13 @@ pub fn process_video_with_paths(
     ffmpeg: &Path,
     ffprobe: &Path,
     edge_detail: u8,
+    quality: &str,
     screen_color: &str,
     preview: bool,
     start_seconds: f64,
+    corrections: &[VideoCorrectionStroke],
 ) -> Result<VideoOutcome, String> {
+    let quality_mode = QualityMode::parse(quality)?;
     let meta = probe(ffprobe, input)?;
     let start = start_seconds.max(0.0).min(meta.duration.max(0.0));
     let clip_duration = if preview {
@@ -216,6 +258,7 @@ pub fn process_video_with_paths(
     } else {
         (meta.width, meta.height, meta.fps_arg.clone(), meta.frames)
     };
+    let output_fps = parse_rate(&fps_arg).unwrap_or(30.0);
 
     if let Some(app) = app {
         emit_progress(
@@ -292,6 +335,7 @@ pub fn process_video_with_paths(
             format!("{clip_duration:.3}"),
         ]);
     }
+    let (full_crf, full_preset) = encoding_profile(quality_mode);
     encode_args.extend([
         "-i".into(),
         input.to_string_lossy().into_owned(),
@@ -304,12 +348,16 @@ pub fn process_video_with_paths(
         "-pix_fmt".into(),
         "yuv420p".into(),
         "-crf".into(),
-        if preview { "24".into() } else { "18".into() },
+        if preview {
+            "24".into()
+        } else {
+            full_crf.into()
+        },
         "-preset".into(),
         if preview {
             "veryfast".into()
         } else {
-            "medium".into()
+            full_preset.into()
         },
         "-c:a".into(),
         "aac".into(),
@@ -363,11 +411,23 @@ pub fn process_video_with_paths(
             Some(image) => image,
             None => break Err("Could not construct video frame".into()),
         };
-        let mut cutout = match masker.apply(&DynamicImage::ImageRgb8(image), edge_detail, control) {
+        let mut cutout = match masker.apply(
+            &DynamicImage::ImageRgb8(image),
+            edge_detail,
+            quality,
+            control,
+        ) {
             Ok(cutout) => cutout,
             Err(error) => break Err(error),
         };
         if let Err(error) = stabilizer.apply(&bytes, &mut cutout) {
+            break Err(error);
+        }
+        let frame_time = start + frame_count as f64 / output_fps;
+        let Some(rgba) = cutout.as_mut_rgba8() else {
+            break Err("Video correction requires an RGBA cutout".into());
+        };
+        if let Err(error) = apply_video_corrections(rgba, corrections, frame_time) {
             break Err(error);
         }
         let composited = composite_screen(&cutout, screen_color);
@@ -450,5 +510,12 @@ mod tests {
     #[test]
     fn preview_duration_is_one_second() {
         assert_eq!(PREVIEW_SECONDS, 1.0);
+    }
+
+    #[test]
+    fn quality_modes_have_distinct_video_profiles() {
+        assert_eq!(encoding_profile(QualityMode::Fast), ("23", "veryfast"));
+        assert_eq!(encoding_profile(QualityMode::Balanced), ("18", "medium"));
+        assert_eq!(encoding_profile(QualityMode::Maximum), ("16", "slow"));
     }
 }
