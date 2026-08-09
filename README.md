@@ -6,6 +6,7 @@ Roto Now is a Windows-first Tauri desktop app for fully local AI-assisted rotosc
 
 - Images produce transparent PNG results.
 - Videos produce green- or blue-screen H.264 MP4 files with source audio.
+- Video exports normalize variable-rate inputs to a source-derived constant frame rate, apply rotation and pixel-aspect metadata, guarantee even square-pixel dimensions, resynchronize the first audio track, and write fast-start MP4 metadata. Completed exports are probed again for dimensions, duration, and audio before the app reports success.
 - A one-second, 12 fps preview starts at the current video playhead and is capped at 1280×720.
 - General Lite is bundled in the installer and copied into the per-user app-data directory on first run. General Maximum and Anime remain verified on-demand downloads.
 - Native Rust runs pinned `ort`/ONNX Runtime inference with DirectML and automatic CPU fallback.
@@ -13,7 +14,6 @@ Roto Now is a Windows-first Tauri desktop app for fully local AI-assisted rotosc
 - One foreground job runs at a time. Image/model phases use indeterminate progress; downloads use bytes; videos use frames and show ETA after three frames.
 - Video masks use motion-aware temporal smoothing to reduce frame-to-frame edge flicker. Stabilization resets on scene cuts and moving pixels favor the current mask; this is lightweight mask propagation rather than full object tracking.
 - Image cutouts can be refined before saving with adjustable Restore and Erase brushes, including undo, clear, and feathered native mask application.
-- Video results support Restore and Erase correction keyframes. Painted strokes are applied at full strength on the selected frame and fade across a bounded half-second window during reprocessing.
 - Auto routing analyzes image content or a sampled video frame locally. It selects Anime only for confidently stylized media when that optional model is installed, otherwise falling back to the selected quality's general model.
 - Fast uses General Lite with quicker mask resampling and faster video encoding, Balanced uses General Lite with detailed resampling and balanced encoding, and Maximum uses General Maximum with the highest-quality video encode profile.
 
@@ -70,8 +70,8 @@ Use **Browse files** to test each workflow:
 
 1. Process a general photograph and confirm the Output preview has transparency, Restore/Erase corrections work, and the saved PNG opens correctly.
 2. Process a stylized or anime image with **Anime**, then try **Auto** and confirm the result summary reports the actual model selected.
-3. Process a short video with audio. Confirm the one-second preview starts at the current playhead, the full MP4 retains its duration, frame rate, dimensions, and audio, and green/blue output selection works.
-4. Inspect detailed moving edges for reduced flicker, then add video correction keyframes and confirm **Reprocess with corrections** changes the intended time range.
+3. Process short constant- and variable-frame-rate videos with audio. Include a phone clip carrying 90° rotation metadata and, when available, a non-square-pixel or odd-dimension source. Confirm the preview starts at the current playhead and the full MP4 is upright, square-pixel, even-dimensioned, duration-matched, audible, and immediately seekable when opened; also verify green/blue output selection.
+4. Inspect detailed moving edges for reduced flicker and confirm scene cuts reset stabilization cleanly.
 5. Compare **Fast**, **Balanced**, and **Maximum**. Maximum should report General Maximum; Fast and Balanced should report General Lite and use visibly different encoding profiles for video.
 6. Cancel a model download, image job, and video job and confirm the app returns to a usable state without presenting a partial result as complete.
 

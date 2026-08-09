@@ -27,6 +27,11 @@ pub struct ProcessResult {
     pub provider: String,
     pub duration_ms: u64,
     pub frame_count: Option<u64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub frame_rate: Option<f64>,
+    pub media_duration_seconds: Option<f64>,
+    pub has_audio: Option<bool>,
     pub preview: bool,
 }
 

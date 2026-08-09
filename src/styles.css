@@ -138,16 +138,6 @@ input[type="range"] { width: 100%; accent-color: var(--lime); height: 4px; }
 .correction-summary span { color: #7e8880; font-size: 9px; }
 .correction-controls .reset-button:disabled { opacity: .35; cursor: not-allowed; }
 .correction-button { border-color: rgba(183,243,74,.35); color: #d8efa9; }
-.video-correction-stage { background: #080a09; }
-.video-keyframe-editor { width: 100%; display: grid; gap: 12px; }
-.video-correction-surface { position: relative; width: 100%; display: grid; place-items: center; overflow: hidden; }
-.video-correction-surface video { display: block; width: 100%; height: auto; max-height: 455px; object-fit: contain; }
-.video-correction-canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
-.video-correction-canvas.mode-restore { cursor: cell; }
-.video-correction-timeline { display: grid; grid-template-columns: 34px 1fr auto; align-items: center; gap: 9px; width: 100%; padding: 0 10px 10px; }
-.video-correction-timeline button { width: 32px; height: 30px; border: 1px solid #394039; border-radius: 7px; display: grid; place-items: center; background: #171c18; color: #d8ded9; cursor: pointer; }
-.video-correction-timeline input { accent-color: var(--lime); }
-.video-correction-timeline output { min-width: 82px; color: #89938b; font-size: 9px; text-align: right; }
 
 @media (max-width: 880px) {
   .editor-grid { grid-template-columns: 1fr; }.preview-panel { min-height: 480px; }

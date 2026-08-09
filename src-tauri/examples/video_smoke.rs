@@ -1,9 +1,4 @@
-use roto_now_lib::{
-    corrections::{CorrectionPoint, CorrectionStroke, VideoCorrectionStroke},
-    jobs::JobControl,
-    models::ModelId,
-    video::process_video_with_paths,
-};
+use roto_now_lib::{jobs::JobControl, models::ModelId, video::process_video_with_paths};
 use std::{
     path::PathBuf,
     sync::{
@@ -15,7 +10,7 @@ use std::{
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 7 {
-        return Err("usage: video_smoke <model.onnx> <ffmpeg.exe> <ffprobe.exe> <input> <output.mp4> <preview|fast|full|maximum|corrected>".into());
+        return Err("usage: video_smoke <model.onnx> <ffmpeg.exe> <ffprobe.exe> <input> <output.mp4> <preview|fast|full|maximum|cancel>".into());
     }
     let cancelled = Arc::new(AtomicBool::new(false));
     let control = JobControl {
@@ -29,17 +24,6 @@ fn main() -> Result<(), String> {
         "maximum" => "Maximum",
         _ => "Balanced",
     };
-    let corrections = (args[6] == "corrected")
-        .then(|| VideoCorrectionStroke {
-            time_seconds: 0.5,
-            stroke: CorrectionStroke {
-                mode: "erase".into(),
-                radius: 0.08,
-                points: vec![CorrectionPoint { x: 0.5, y: 0.5 }],
-            },
-        })
-        .into_iter()
-        .collect::<Vec<_>>();
     if args[6] == "cancel" {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(8));
@@ -60,7 +44,6 @@ fn main() -> Result<(), String> {
         "green",
         preview,
         0.0,
-        &corrections,
     );
     if args[6] == "cancel" {
         match result {
@@ -77,6 +60,15 @@ fn main() -> Result<(), String> {
         }
     }
     let result = result?;
-    println!("frames={} provider={}", result.frame_count, result.provider);
+    println!(
+        "frames={} size={}x{} fps={:.3} duration={:.3} audio={} provider={}",
+        result.frame_count,
+        result.width,
+        result.height,
+        result.frame_rate,
+        result.duration,
+        result.has_audio,
+        result.provider
+    );
     Ok(())
 }
