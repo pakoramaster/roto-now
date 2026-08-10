@@ -16,9 +16,13 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager, State};
+
+const MAX_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_VIDEO_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+const STALE_OUTPUT_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,6 +46,16 @@ struct MediaInfo {
 #[derive(Default)]
 struct OutputState {
     outputs: Mutex<HashMap<PathBuf, bool>>,
+}
+
+impl Drop for OutputState {
+    fn drop(&mut self) {
+        for output in self.outputs.get_mut().keys() {
+            if is_managed_output_path(output) {
+                let _ = fs::remove_file(output);
+            }
+        }
+    }
 }
 
 fn extension_kind(path: &Path) -> Option<(&'static str, &'static str)> {
@@ -71,6 +85,9 @@ fn managed_temp_root() -> PathBuf {
 }
 
 fn new_managed_output(extension: &str) -> Result<PathBuf, String> {
+    if !matches!(extension, "png" | "mp4") {
+        return Err("Unsupported managed output type".into());
+    }
     let root = managed_temp_root();
     fs::create_dir_all(&root)
         .map_err(|error| format!("Could not create temporary output folder: {error}"))?;
@@ -82,6 +99,49 @@ fn new_managed_output(extension: &str) -> Result<PathBuf, String> {
         "result-{}-{timestamp}.{extension}",
         std::process::id()
     )))
+}
+
+fn is_managed_output_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    path.parent()
+        .is_some_and(|parent| parent == managed_temp_root())
+        && name.starts_with("result-")
+        && matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("png" | "mp4")
+        )
+}
+
+fn is_managed_output_file(path: &Path) -> bool {
+    is_managed_output_path(path)
+        && fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false)
+}
+
+fn cleanup_stale_outputs() {
+    let root = managed_temp_root();
+    let Ok(entries) = fs::read_dir(&root) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_managed_output_path(&path) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= STALE_OUTPUT_AGE);
+        if stale {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 fn anime_installed(app: &AppHandle) -> bool {
@@ -102,8 +162,11 @@ fn verify_input(path: &str, kind: &str) -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-fn inspect_media(path: String) -> Result<MediaInfo, String> {
+fn inspect_media(app: AppHandle, path: String) -> Result<MediaInfo, String> {
     let source = PathBuf::from(&path);
+    if !app.asset_protocol_scope().is_allowed(&source) {
+        return Err("Choose the input through Roto Now's file picker".into());
+    }
     let metadata =
         fs::metadata(&source).map_err(|error| format!("Could not inspect file: {error}"))?;
     if !metadata.is_file() {
@@ -111,6 +174,21 @@ fn inspect_media(path: String) -> Result<MediaInfo, String> {
     }
     let (kind, mime) =
         extension_kind(&source).ok_or("Choose a PNG, JPG, WEBP, MP4, MOV, or WEBM file")?;
+    let maximum = if kind == "image" {
+        MAX_IMAGE_BYTES
+    } else {
+        MAX_VIDEO_BYTES
+    };
+    if metadata.len() > maximum {
+        let limit = if maximum >= 1024 * 1024 * 1024 {
+            format!("{} GB", maximum / 1024 / 1024 / 1024)
+        } else {
+            format!("{} MB", maximum / 1024 / 1024)
+        };
+        return Err(format!(
+            "The selected {kind} is too large (maximum {limit})"
+        ));
+    }
     let preview_data_url = (kind == "image")
         .then(|| image_data_url(&source, mime))
         .transpose()?;
@@ -386,6 +464,7 @@ fn start_video_job(
 
 #[tauri::command]
 fn save_output(
+    app: AppHandle,
     outputs: State<'_, OutputState>,
     source_path: String,
     destination_path: String,
@@ -394,10 +473,13 @@ fn save_output(
     if outputs.outputs.lock().get(&source) != Some(&true) {
         return Err("Preview outputs cannot be saved; run the full export first".into());
     }
-    if !source.is_file() || !source.starts_with(managed_temp_root()) {
+    if !is_managed_output_file(&source) {
         return Err("Only Roto Now temporary results can be saved".into());
     }
     let destination = PathBuf::from(&destination_path);
+    if !app.asset_protocol_scope().is_allowed(&destination) {
+        return Err("Choose the destination through Roto Now's save dialog".into());
+    }
     if source
         .extension()
         .map(|v| v.to_string_lossy().to_ascii_lowercase())
@@ -419,8 +501,7 @@ fn apply_image_corrections(
 ) -> Result<String, String> {
     let source = PathBuf::from(&source_path);
     if outputs.outputs.lock().get(&source) != Some(&true)
-        || !source.is_file()
-        || !source.starts_with(managed_temp_root())
+        || !is_managed_output_file(&source)
         || source.extension().and_then(|value| value.to_str()) != Some("png")
     {
         return Err("Only a managed PNG result can be corrected".into());
@@ -441,13 +522,18 @@ fn apply_image_corrections(
 #[tauri::command]
 fn discard_output(outputs: State<'_, OutputState>, path: String) -> Result<(), String> {
     let output = PathBuf::from(path);
-    if outputs.outputs.lock().remove(&output).is_none() {
+    let mut registered = outputs.outputs.lock();
+    if !registered.contains_key(&output) {
         return Ok(());
     }
+    if !is_managed_output_path(&output) {
+        return Err("Refusing to discard a path outside Roto Now's temporary outputs".into());
+    }
     if output.is_file() {
-        fs::remove_file(output)
+        fs::remove_file(&output)
             .map_err(|error| format!("Could not discard temporary result: {error}"))?;
     }
+    registered.remove(&output);
     Ok(())
 }
 
@@ -463,6 +549,7 @@ fn engine_status() -> EngineStatus {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    cleanup_stale_outputs();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(JobState::default())
@@ -483,4 +570,51 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Roto Now");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_extensions_are_allowlisted_case_insensitively() {
+        assert_eq!(extension_kind(Path::new("photo.PNG")).unwrap().0, "image");
+        assert_eq!(extension_kind(Path::new("clip.MOV")).unwrap().0, "video");
+        assert!(extension_kind(Path::new("payload.exe")).is_none());
+        assert!(extension_kind(Path::new("no-extension")).is_none());
+    }
+
+    #[test]
+    fn managed_output_policy_rejects_nested_and_unrelated_paths() {
+        let root = managed_temp_root();
+        assert!(is_managed_output_path(&root.join("result-10-20.png")));
+        assert!(is_managed_output_path(&root.join("result-10-20.mp4")));
+        assert!(!is_managed_output_path(&root.join("unrelated.png")));
+        assert!(!is_managed_output_path(
+            &root.join("nested").join("result-10-20.png")
+        ));
+        assert!(!is_managed_output_path(
+            &root
+                .with_file_name("roto-now-elsewhere")
+                .join("result-10-20.png")
+        ));
+    }
+
+    #[test]
+    fn output_state_removes_registered_managed_files_on_drop() {
+        let root = managed_temp_root();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(format!(
+            "result-test-{}.png",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, b"temporary result").unwrap();
+        let state = OutputState::default();
+        state.outputs.lock().insert(path.clone(), true);
+        drop(state);
+        assert!(!path.exists());
+    }
 }

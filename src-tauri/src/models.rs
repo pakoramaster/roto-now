@@ -117,6 +117,7 @@ fn development_model_path(id: ModelId) -> Option<PathBuf> {
     Some(development_model_path_from_root(&root, id))
 }
 
+#[cfg(any(debug_assertions, test))]
 fn development_model_path_from_root(root: &Path, id: ModelId) -> PathBuf {
     let folder = if id == ModelId::Anime {
         "toonout"
