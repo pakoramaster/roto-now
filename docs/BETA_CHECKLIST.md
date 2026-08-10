@@ -25,7 +25,7 @@ Complete this checklist on a clean Windows user account before publishing a beta
 
 - [ ] Process and save a general photograph; inspect transparency and fine edges.
 - [ ] Refine an image with Restore and Erase, undo a stroke, and confirm the saved PNG matches the preview.
-- [ ] Process a stylized image with Anime and Auto; confirm the reported route is reasonable.
+- [ ] Process a stylized image with Anime and a photograph with General; confirm each result reports the selected model.
 - [ ] Compare Fast, Balanced, and Maximum and confirm the reported model matches the selected mode.
 - [ ] Preview and export an audio-bearing video with green and blue backgrounds.
 - [ ] Test a variable-frame-rate or rotated phone video and confirm orientation, timing, dimensions, seeking, and audio.

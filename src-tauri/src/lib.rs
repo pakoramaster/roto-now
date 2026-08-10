@@ -144,12 +144,6 @@ fn cleanup_stale_outputs() {
     }
 }
 
-fn anime_installed(app: &AppHandle) -> bool {
-    models::model_path(app, ModelId::Anime)
-        .map(|path| path.is_file())
-        .unwrap_or(false)
-}
-
 fn verify_input(path: &str, kind: &str) -> Result<PathBuf, String> {
     let input = PathBuf::from(path);
     if !input.is_file() {
@@ -217,16 +211,7 @@ fn start_image_job(
 ) -> Result<String, String> {
     let input = verify_input(&input_path, "image")?;
     let quality_mode = routing::QualityMode::parse(&quality)?;
-    let source_for_routing = model
-        .eq_ignore_ascii_case("auto")
-        .then(|| image::open(&input).map_err(|error| format!("Could not open image: {error}")))
-        .transpose()?;
-    let model_id = routing::select_model(
-        &model,
-        quality_mode,
-        source_for_routing.as_ref(),
-        anime_installed(&app),
-    )?;
+    let model_id = routing::select_model(&model, quality_mode)?;
     let model_path = models::model_path(&app, model_id)?;
     if !model_path.is_file() {
         return Err(format!(
@@ -242,12 +227,8 @@ fn start_image_job(
     tauri::async_runtime::spawn_blocking(move || {
         let started = Instant::now();
         let outcome = (|| {
-            let source = match source_for_routing {
-                Some(source) => source,
-                None => {
-                    image::open(&input).map_err(|error| format!("Could not open image: {error}"))?
-                }
-            };
+            let source =
+                image::open(&input).map_err(|error| format!("Could not open image: {error}"))?;
             app_for_task.state::<ModelSessionCache>().with_model(
                 model_path,
                 model_id,
@@ -362,30 +343,19 @@ fn start_video_job(
         return Err("Screen colour must be green or blue".into());
     }
     let quality_mode = routing::QualityMode::parse(&quality)?;
-    let routing_quality = if preview {
+    let selected_quality = if preview {
         routing::QualityMode::Fast
     } else {
         quality_mode
     };
-    let routing_sample = model
-        .eq_ignore_ascii_case("auto")
-        .then(|| video::routing_sample(&app, &input))
-        .transpose()
-        .ok()
-        .flatten();
-    let model_id = routing::select_model(
-        &model,
-        routing_quality,
-        routing_sample.as_ref(),
-        anime_installed(&app),
-    )?;
+    let model_id = routing::select_model(&model, selected_quality)?;
     if !models::model_path(&app, model_id)?.is_file() {
         return Err(format!(
             "{} must be downloaded before processing",
             models::spec(model_id).name
         ));
     }
-    let output = new_managed_output("mp4")?;
+    let output = new_managed_output(if preview { "png" } else { "mp4" })?;
     let control = jobs.begin()?;
     let job_id = control.id.clone();
     let app_for_task = app.clone();

@@ -114,7 +114,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Roto Now local inference worker")
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--model", choices=["auto", "general", "anime"], default="auto")
+    parser.add_argument("--model", choices=["general", "anime"], default="general")
     parser.add_argument("--quality", choices=["fast", "balanced", "maximum"], default="balanced")
     parser.add_argument("--edge-detail", type=int, default=72)
     parser.add_argument("--models-dir", required=True)
@@ -136,7 +136,7 @@ def main() -> int:
     models_dir.mkdir(parents=True, exist_ok=True)
     os.environ["U2NET_HOME"] = str(models_dir / "rembg")
 
-    selected_model = "general" if args.model == "auto" else args.model
+    selected_model = args.model
     try:
         if selected_model == "anime":
             provider = process_anime(input_path, output_path, args.edge_detail, models_dir)
