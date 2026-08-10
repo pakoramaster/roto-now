@@ -146,16 +146,13 @@ jobs:
           $installers = @(Get-ChildItem "src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis\*.exe")
           if ($installers.Count -ne 1) { throw "Expected exactly one NSIS installer, found $($installers.Count)." }
           $installer = $installers[0]
-          $checksumPath = "$($installer.FullName).sha256"
-          $checksum = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$checksum  $($installer.Name)" | Set-Content -LiteralPath $checksumPath -Encoding ascii
           gh release view $env:RELEASE_TAG --json tagName 2>$null | Out-Null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:RELEASE_TAG $installer.FullName $checksumPath --clobber
+            gh release upload $env:RELEASE_TAG $installer.FullName --clobber
             if ($LASTEXITCODE -ne 0) { throw "Could not overwrite release asset." }
             gh release edit $env:RELEASE_TAG --title "Roto Now $env:RELEASE_VERSION" --prerelease=false --latest
             if ($LASTEXITCODE -ne 0) { throw "Could not update release metadata." }
           } else {
-            gh release create $env:RELEASE_TAG $installer.FullName $checksumPath --verify-tag --title "Roto Now $env:RELEASE_VERSION" --generate-notes --latest
+            gh release create $env:RELEASE_TAG $installer.FullName --verify-tag --title "Roto Now $env:RELEASE_VERSION" --generate-notes --latest
             if ($LASTEXITCODE -ne 0) { throw "Could not create release." }
           }

@@ -1,6 +1,6 @@
 [package]
 name = "roto-now"
-version = "0.2.1"
+version = "0.2.2"
 description = "Local AI-assisted rotoscoping for images and video"
 authors = ["Roto Now"]
 edition = "2021"
