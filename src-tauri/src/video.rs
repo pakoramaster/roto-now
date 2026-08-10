@@ -16,7 +16,9 @@ use std::{
 };
 use tauri::{AppHandle, Manager};
 
-const PREVIEW_SECONDS: f64 = 1.0;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const PREVIEW_FRAME_COUNT: u64 = 1;
 
 #[derive(Deserialize)]
 struct Probe {
@@ -88,29 +90,14 @@ fn bundled_binary(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
     ))
 }
 
-pub fn routing_sample(app: &AppHandle, input: &Path) -> Result<DynamicImage, String> {
-    let ffmpeg = bundled_binary(app, "ffmpeg")?;
-    let output = Command::new(ffmpeg)
-        .args(["-hide_banner", "-loglevel", "error", "-i"])
-        .arg(input)
-        .args([
-            "-frames:v",
-            "1",
-            "-vf",
-            "scale=192:192:force_original_aspect_ratio=decrease",
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "png",
-            "pipe:1",
-        ])
-        .output()
-        .map_err(|error| format!("Could not sample the video for automatic routing: {error}"))?;
-    if !output.status.success() {
-        return Err("Could not sample this video for automatic routing".into());
+fn background_command(program: &Path) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
     }
-    image::load_from_memory(&output.stdout)
-        .map_err(|error| format!("Could not read the automatic-routing frame: {error}"))
+    command
 }
 
 fn parse_rate(rate: &str) -> Option<f64> {
@@ -168,7 +155,7 @@ fn encoding_profile(quality: QualityMode) -> (&'static str, &'static str) {
 }
 
 fn probe(ffprobe: &Path, source: &Path) -> Result<VideoMeta, String> {
-    let output = Command::new(ffprobe)
+    let output = background_command(ffprobe)
         .args([
             "-v",
             "error",
@@ -416,6 +403,101 @@ pub fn process_video_with_paths(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn process_preview_frame(
+    app: Option<&AppHandle>,
+    control: &JobControl,
+    input: &Path,
+    output: &Path,
+    masker: &mut Masker,
+    ffmpeg: &Path,
+    edge_detail: u8,
+    quality: &str,
+    screen_color: &str,
+    start_seconds: f64,
+    meta: &VideoMeta,
+) -> Result<VideoOutcome, String> {
+    if control.cancelled.load(Ordering::SeqCst) {
+        return Err("cancelled".into());
+    }
+    let fps = parse_rate(&meta.fps_arg).unwrap_or(30.0).max(1.0);
+    let last_frame_time = (meta.duration - 1.0 / fps).max(0.0);
+    let start = start_seconds.max(0.0).min(last_frame_time);
+    let (width, height) = preview_dimensions(meta.width, meta.height);
+    if let Some(app) = app {
+        emit_progress(
+            app,
+            control,
+            "processingFrames",
+            Some(0),
+            Some(PREVIEW_FRAME_COUNT),
+            None,
+            "Processing preview frame",
+        );
+    }
+    let decoded = background_command(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-ss"])
+        .arg(format!("{start:.6}"))
+        .arg("-i")
+        .arg(input)
+        .args([
+            "-frames:v",
+            "1",
+            "-vf",
+            &format!("scale={width}:{height}:flags=lanczos,setsar=1"),
+            "-an",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ])
+        .output()
+        .map_err(|error| format!("Could not decode the preview frame: {error}"))?;
+    if !decoded.status.success() {
+        let details = String::from_utf8_lossy(&decoded.stderr).trim().to_string();
+        return Err(if details.is_empty() {
+            "FFmpeg could not decode the preview frame".into()
+        } else {
+            format!("FFmpeg could not decode the preview frame: {details}")
+        });
+    }
+    let frame = ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, decoded.stdout)
+        .ok_or("FFmpeg returned an incomplete preview frame")?;
+    let cutout = masker.apply(
+        &DynamicImage::ImageRgb8(frame),
+        edge_detail,
+        quality,
+        control,
+    )?;
+    let composited =
+        ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, composite_screen(&cutout, screen_color))
+            .ok_or("Could not construct the preview image")?;
+    composited
+        .save_with_format(output, image::ImageFormat::Png)
+        .map_err(|error| format!("Could not save the preview frame: {error}"))?;
+    if let Some(app) = app {
+        emit_progress(
+            app,
+            control,
+            "processingFrames",
+            Some(PREVIEW_FRAME_COUNT),
+            Some(PREVIEW_FRAME_COUNT),
+            None,
+            "Preview frame ready",
+        );
+    }
+    Ok(VideoOutcome {
+        frame_count: PREVIEW_FRAME_COUNT,
+        provider: masker.provider().into(),
+        width,
+        height,
+        frame_rate: fps,
+        duration: 0.0,
+        has_audio: false,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn process_video_with_masker(
     app: Option<&AppHandle>,
     control: &JobControl,
@@ -432,48 +514,34 @@ fn process_video_with_masker(
 ) -> Result<VideoOutcome, String> {
     let quality_mode = QualityMode::parse(quality)?;
     let meta = probe(ffprobe, input)?;
-    let start = start_seconds.max(0.0).min(meta.duration.max(0.0));
-    let clip_duration = if preview {
-        (meta.duration - start).clamp(0.0, PREVIEW_SECONDS)
-    } else {
-        meta.duration
-    };
-    if preview && clip_duration <= 0.0 {
-        return Err("The playhead is at the end of the video".into());
+    if preview {
+        return process_preview_frame(
+            app,
+            control,
+            input,
+            output,
+            masker,
+            ffmpeg,
+            edge_detail,
+            quality,
+            screen_color,
+            start_seconds,
+            &meta,
+        );
     }
-    let (width, height, fps_arg, total) = if preview {
-        let (width, height) = preview_dimensions(meta.width, meta.height);
-        (
-            width,
-            height,
-            "12/1".to_string(),
-            (clip_duration * 12.0).ceil() as u64,
-        )
-    } else {
-        (meta.width, meta.height, meta.fps_arg.clone(), meta.frames)
-    };
+    let clip_duration = meta.duration;
+    let (width, height, fps_arg, total) =
+        (meta.width, meta.height, meta.fps_arg.clone(), meta.frames);
     if control.cancelled.load(Ordering::SeqCst) {
         return Err("cancelled".into());
     }
 
     let mut decode_args = vec!["-hide_banner".into(), "-loglevel".into(), "error".into()];
-    if preview {
-        decode_args.extend([
-            "-ss".into(),
-            format!("{start:.3}"),
-            "-t".into(),
-            format!("{clip_duration:.3}"),
-        ]);
-    }
     decode_args.extend(["-i".into(), input.to_string_lossy().into_owned()]);
-    let decode_filter = if preview {
-        format!("fps=12,scale={width}:{height}:flags=lanczos,setsar=1")
-    } else {
-        format!(
-            "fps={},scale={width}:{height}:flags=lanczos,setsar=1",
-            meta.fps_arg
-        )
-    };
+    let decode_filter = format!(
+        "fps={},scale={width}:{height}:flags=lanczos,setsar=1",
+        meta.fps_arg
+    );
     decode_args.extend([
         "-vf".into(),
         decode_filter,
@@ -488,7 +556,7 @@ fn process_video_with_masker(
         "rgb24".into(),
         "pipe:1".into(),
     ]);
-    let mut decoder = Command::new(ffmpeg)
+    let mut decoder = background_command(ffmpeg)
         .args(&decode_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -513,14 +581,6 @@ fn process_video_with_masker(
         "-i".into(),
         "pipe:0".into(),
     ];
-    if preview {
-        encode_args.extend([
-            "-ss".into(),
-            format!("{start:.3}"),
-            "-t".into(),
-            format!("{clip_duration:.3}"),
-        ]);
-    }
     let (full_crf, full_preset) = encoding_profile(quality_mode);
     encode_args.extend(["-i".into(), input.to_string_lossy().into_owned()]);
     encode_args.extend(["-map".into(), "0:v:0".into()]);
@@ -535,17 +595,9 @@ fn process_video_with_masker(
         "-pix_fmt".into(),
         "yuv420p".into(),
         "-crf".into(),
-        if preview {
-            "24".into()
-        } else {
-            full_crf.into()
-        },
+        full_crf.into(),
         "-preset".into(),
-        if preview {
-            "veryfast".into()
-        } else {
-            full_preset.into()
-        },
+        full_preset.into(),
         "-fps_mode".into(),
         "cfr".into(),
         "-map_metadata".into(),
@@ -568,7 +620,7 @@ fn process_video_with_masker(
         ]);
     }
     encode_args.push(output.to_string_lossy().into_owned());
-    let mut encoder = Command::new(ffmpeg)
+    let mut encoder = background_command(ffmpeg)
         .args(&encode_args)
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
@@ -770,8 +822,8 @@ mod tests {
     }
 
     #[test]
-    fn preview_duration_is_one_second() {
-        assert_eq!(PREVIEW_SECONDS, 1.0);
+    fn preview_output_is_a_single_frame_image() {
+        assert_eq!(PREVIEW_FRAME_COUNT, 1);
     }
 
     #[test]

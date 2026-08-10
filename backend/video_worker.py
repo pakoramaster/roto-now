@@ -126,7 +126,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Roto Now video worker")
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--model", choices=["auto", "general", "anime"], default="auto")
+    parser.add_argument("--model", choices=["general", "anime"], default="general")
     parser.add_argument("--quality", choices=["fast", "balanced", "maximum"], default="balanced")
     parser.add_argument("--edge-detail", type=int, default=72)
     parser.add_argument("--screen-color", choices=["green", "blue"], default="green")
@@ -147,7 +147,7 @@ def main() -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     models_dir.mkdir(parents=True, exist_ok=True)
     os.environ["U2NET_HOME"] = str(models_dir / "rembg")
-    selected_model = "general" if args.model == "auto" else args.model
+    selected_model = args.model
 
     reader = None
     writer = None

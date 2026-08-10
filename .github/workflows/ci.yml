@@ -34,6 +34,27 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      # Tauri validates every configured bundle resource while compiling its
+      # build script, including during clippy and tests. Source verification
+      # does not package or execute these files; release builds fetch and
+      # verify the real FFmpeg binaries and model before packaging.
+      - name: Prepare source-check resource placeholders
+        shell: pwsh
+        run: |
+          $resources = @(
+            "src-tauri/bin/ffmpeg.exe",
+            "src-tauri/bin/ffprobe.exe",
+            "src-tauri/models/birefnet-general-lite.onnx"
+          )
+
+          foreach ($resource in $resources) {
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $resource) | Out-Null
+
+            if (-not (Test-Path -LiteralPath $resource -PathType Leaf)) {
+              New-Item -ItemType File -Path $resource | Out-Null
+            }
+          }
+
       - name: Test native application
         run: |
           cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
