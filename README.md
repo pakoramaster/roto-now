@@ -50,7 +50,11 @@ $env:RUSTUP_HOME = Join-Path (Get-Location) ".toolchains\rustup"
 $env:Path = "$(Join-Path $env:CARGO_HOME 'bin');$env:Path"
 
 cargo test --manifest-path src-tauri\Cargo.toml
+
+./scripts/verify-release.ps1
 ```
+
+Pull requests and pushes to `main` run the same frontend build, locked Rust test suite, and release-configuration checks on GitHub Actions.
 
 After Python reference-worker changes, also run:
 
@@ -110,7 +114,13 @@ cargo run --manifest-path src-tauri\Cargo.toml --example parity -- `
 
 Each command should finish with `provider=CPUExecutionProvider` and create a transparent PNG in `%TEMP%\roto-now-model-tests`. These direct smoke tests intentionally use CPU for deterministic parity; the desktop app still prefers DirectML and falls back to CPU automatically.
 
-Build the public-alpha NSIS installer with:
+### Security and temporary files
+
+The desktop capability grants only the open and save dialogs. The asset protocol is statically limited to Roto Now's managed temporary output directory; choosing a file through a native dialog dynamically grants only that selected path. Native commands reject input and destination paths that were not selected through those dialogs. Managed results are deleted when discarded or on a normal app shutdown, and abandoned results older than 24 hours are removed at the next launch.
+
+### Windows installer and signing
+
+Build the NSIS installer with:
 
 ```powershell
 .\scripts\fetch-ffmpeg.ps1
@@ -118,4 +128,19 @@ Build the public-alpha NSIS installer with:
 npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis
 ```
 
-Every push to `main` builds and publishes the Windows release named from `package.json`. If that version already has a release, its tag is moved to the new commit and its installer asset is overwritten. Changing the package version creates a new release. If the `WINDOWS_SIGNING_CERTIFICATE` and `WINDOWS_SIGNING_PASSWORD` repository secrets are present, the installer is Authenticode-signed before upload.
+Before packaging, validate synchronized versions, the production CSP, installer policy, and pinned bundle hashes:
+
+```powershell
+./scripts/verify-release.ps1 -RequireBundleAssets
+```
+
+Every push to `main` builds and publishes the Windows release named from `package.json`. Release tags are immutable: if the version tag already belongs to another commit, automation stops and requires a version increment. Each release includes the installer and a SHA-256 checksum file.
+
+For Authenticode signing, configure both repository secrets:
+
+- `WINDOWS_SIGNING_CERTIFICATE`: base64-encoded PFX certificate
+- `WINDOWS_SIGNING_PASSWORD`: PFX password
+
+The certificate is written only to the temporary GitHub runner, used by Tauri's custom signing command for the application executable and installer, verified with SignTool, and removed even when a later step fails. Builds without both secrets remain explicitly unsigned.
+
+The release job silently installs the generated NSIS package into an isolated runner directory twice (initial install and repair), checks the bundled FFmpeg/model files, runs the uninstaller, and verifies that the executable is removed. Before a public release, also perform a manual clean-install and upgrade test on a standard Windows account, launch the app once, process an image and an audio-bearing video, then uninstall and confirm user-selected exports remain untouched. Per-user downloaded models intentionally remain in app data unless the user removes them from the model manager.
