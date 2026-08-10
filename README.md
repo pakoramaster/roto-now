@@ -2,7 +2,7 @@
 
 Roto Now is a Windows-first Tauri desktop app for fully local AI-assisted rotoscoping and background removal.
 
-## Public alpha scope
+## Beta scope
 
 - Images produce transparent PNG results.
 - Videos produce green- or blue-screen H.264 MP4 files with source audio.
@@ -16,6 +16,9 @@ Roto Now is a Windows-first Tauri desktop app for fully local AI-assisted rotosc
 - Image cutouts can be refined before saving with adjustable Restore and Erase brushes, including undo, clear, and feathered native mask application.
 - Auto routing analyzes image content or a sampled video frame locally. It selects Anime only for confidently stylized media when that optional model is installed, otherwise falling back to the selected quality's general model.
 - Fast uses General Lite with quicker mask resampling and faster video encoding, Balanced uses General Lite with detailed resampling and balanced encoding, and Maximum uses General Maximum with the highest-quality video encode profile.
+- The desktop interface includes keyboard-visible focus states, responsive layouts, and an in-app Help & About panel with runtime details.
+
+Before publishing a beta build, complete the [beta release checklist](docs/BETA_CHECKLIST.md).
 
 ## Development
 
@@ -134,7 +137,7 @@ Before packaging, validate synchronized versions, the production CSP, installer 
 ./scripts/verify-release.ps1 -RequireBundleAssets
 ```
 
-Every push to `main` builds and publishes the Windows release named from `package.json`. Release tags are immutable: if the version tag already belongs to another commit, automation stops and requires a version increment. Each release includes the installer and a SHA-256 checksum file.
+Every push to `main` builds and publishes the Windows release named from `package.json`. Release tags are immutable: if the version tag already belongs to another commit, automation stops and requires a version increment. GitHub displays the installer's calculated SHA-256 digest directly in the release assets list.
 
 For Authenticode signing, configure both repository secrets:
 
@@ -143,4 +146,4 @@ For Authenticode signing, configure both repository secrets:
 
 The certificate is written only to the temporary GitHub runner, used by Tauri's custom signing command for the application executable and installer, verified with SignTool, and removed even when a later step fails. Builds without both secrets remain explicitly unsigned.
 
-The release job silently installs the generated NSIS package into an isolated runner directory twice (initial install and repair), checks the bundled FFmpeg/model files, runs the uninstaller, and verifies that the executable is removed. Before a public release, also perform a manual clean-install and upgrade test on a standard Windows account, launch the app once, process an image and an audio-bearing video, then uninstall and confirm user-selected exports remain untouched. Per-user downloaded models intentionally remain in app data unless the user removes them from the model manager.
+The release job silently installs the generated NSIS package into an isolated runner directory twice (initial install and repair), checks the bundled FFmpeg/model files, runs the uninstaller, and verifies that the executable is removed. Before a beta release, also perform a manual clean-install and upgrade test on a standard Windows account, launch the app once, process an image and an audio-bearing video, then uninstall and confirm user-selected exports remain untouched. Per-user downloaded models intentionally remain in app data unless the user removes them from the model manager.
