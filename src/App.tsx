@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } f
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { ArrowRight, Brush, Check, CircleHelp, Download, Eraser, FileImage, Film, FolderOpen, Image as ImageIcon, Layers3, Maximize2, Pause, Play, RotateCcw, Settings2, Trash2, Undo2, UploadCloud, Volume2, VolumeX, WandSparkles, X, Zap } from "lucide-react";
+import { ArrowRight, Brush, Check, CircleHelp, Download, Eraser, FileImage, Film, FolderOpen, Image as ImageIcon, Layers3, Maximize2, Minimize2, Pause, Play, RotateCcw, Settings2, Trash2, Undo2, UploadCloud, Volume2, VolumeX, WandSparkles, X, Zap } from "lucide-react";
 
 type MediaKind = "image" | "video";
 type Quality = "Fast" | "Balanced" | "Maximum";
@@ -237,6 +237,24 @@ function VideoPlayer({ source, onTimeChange }: { source: string; onTimeChange?: 
   const [muted, setMuted] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [fullscreen, setFullscreen] = useState(false);
+
+  useEffect(() => {
+    if (!playing) return;
+    let animationFrame = 0;
+    const updatePlayhead = () => {
+      if (videoRef.current) setCurrentTime(videoRef.current.currentTime);
+      animationFrame = requestAnimationFrame(updatePlayhead);
+    };
+    animationFrame = requestAnimationFrame(updatePlayhead);
+    return () => cancelAnimationFrame(animationFrame);
+  }, [playing]);
+
+  useEffect(() => {
+    const updateFullscreen = () => setFullscreen(document.fullscreenElement === playerRef.current);
+    document.addEventListener("fullscreenchange", updateFullscreen);
+    return () => document.removeEventListener("fullscreenchange", updateFullscreen);
+  }, []);
 
   const togglePlayback = () => {
     const video = videoRef.current;
@@ -259,8 +277,12 @@ function VideoPlayer({ source, onTimeChange }: { source: string; onTimeChange?: 
     setMuted(video.muted);
   };
 
-  const enterFullscreen = () => {
-    if (playerRef.current?.requestFullscreen) void playerRef.current.requestFullscreen();
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) {
+      void document.exitFullscreen();
+    } else if (playerRef.current?.requestFullscreen) {
+      void playerRef.current.requestFullscreen();
+    }
   };
 
   return <div className="video-player" ref={playerRef}>
@@ -271,7 +293,7 @@ function VideoPlayer({ source, onTimeChange }: { source: string; onTimeChange?: 
       <input className="video-seek" aria-label="Video position" type="range" min="0" max={Math.max(duration, 0.01)} step="0.01" value={Math.min(currentTime, Math.max(duration, 0.01))} onChange={(event) => seek(Number(event.target.value))} />
       <span className="video-time">{formatTime(duration)}</span>
       <button type="button" aria-label={muted ? "Unmute video" : "Mute video"} onClick={toggleMute}>{muted ? <VolumeX size={15} /> : <Volume2 size={15} />}</button>
-      <button type="button" aria-label="Enter fullscreen" onClick={enterFullscreen}><Maximize2 size={14} /></button>
+      <button type="button" aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"} onClick={toggleFullscreen}>{fullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}</button>
     </div>
   </div>;
 }
