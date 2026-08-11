@@ -1,5 +1,5 @@
 use crate::{
-    inference::{composite_screen, Masker},
+    inference::{composite_screen, composite_screen_into, Masker},
     jobs::{emit_progress, JobControl},
     models::ModelId,
     routing::QualityMode,
@@ -151,6 +151,87 @@ fn encoding_profile(quality: QualityMode) -> (&'static str, &'static str) {
         QualityMode::Fast => ("23", "veryfast"),
         QualityMode::Balanced => ("18", "medium"),
         QualityMode::Maximum => ("16", "slow"),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoEncoder {
+    Nvidia,
+    Software,
+}
+
+impl VideoEncoder {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Nvidia => "NVIDIA NVENC",
+            Self::Software => "software H.264",
+        }
+    }
+}
+
+fn select_video_encoder(ffmpeg: &Path, width: u32, height: u32) -> VideoEncoder {
+    // Listing encoders only proves that FFmpeg was compiled with NVENC. Encode
+    // one frame at the output dimensions so missing drivers, unsupported
+    // dimensions, and current VRAM pressure all fall back before export.
+    let probe_source = format!("color=c=black:s={width}x{height}:r=1");
+    let status = background_command(ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            &probe_source,
+            "-frames:v",
+            "1",
+            "-an",
+            "-c:v",
+            "h264_nvenc",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "null",
+            "-",
+        ])
+        .status();
+    if status.is_ok_and(|status| status.success()) {
+        VideoEncoder::Nvidia
+    } else {
+        VideoEncoder::Software
+    }
+}
+
+fn append_video_encoder_args(args: &mut Vec<String>, quality: QualityMode, encoder: VideoEncoder) {
+    let (quality_value, preset) = encoding_profile(quality);
+    match encoder {
+        VideoEncoder::Nvidia => {
+            let preset = match quality {
+                QualityMode::Fast => "p2",
+                QualityMode::Balanced => "p4",
+                QualityMode::Maximum => "p6",
+            };
+            args.extend([
+                "-c:v".into(),
+                "h264_nvenc".into(),
+                "-preset".into(),
+                preset.into(),
+                "-rc".into(),
+                "vbr".into(),
+                "-cq".into(),
+                quality_value.into(),
+                "-b:v".into(),
+                "0".into(),
+            ]);
+        }
+        VideoEncoder::Software => args.extend([
+            "-c:v".into(),
+            "libx264".into(),
+            "-crf".into(),
+            quality_value.into(),
+            "-preset".into(),
+            preset.into(),
+        ]),
     }
 }
 
@@ -469,9 +550,10 @@ fn process_preview_frame(
         quality,
         control,
     )?;
-    let composited =
-        ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, composite_screen(&cutout, screen_color))
-            .ok_or("Could not construct the preview image")?;
+    let composited_bytes = composite_screen(&cutout, screen_color);
+    masker.recycle_cutout(cutout);
+    let composited = ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, composited_bytes)
+        .ok_or("Could not construct the preview image")?;
     composited
         .save_with_format(output, image::ImageFormat::Png)
         .map_err(|error| format!("Could not save the preview frame: {error}"))?;
@@ -535,6 +617,31 @@ fn process_video_with_masker(
     if control.cancelled.load(Ordering::SeqCst) {
         return Err("cancelled".into());
     }
+    // On some Windows/NVIDIA driver combinations, initializing NVENC while a
+    // DirectML session is active removes the D3D device used by ONNX Runtime.
+    // Segmentation is the dominant cost, so preserve GPU inference and use
+    // NVENC to occupy an otherwise idle GPU only after inference fell back to
+    // CPU during session creation.
+    let video_encoder = if masker.provider() == "DmlExecutionProvider" {
+        VideoEncoder::Software
+    } else {
+        select_video_encoder(ffmpeg, width, height)
+    };
+    if let Some(app) = app {
+        emit_progress(
+            app,
+            control,
+            "processingFrames",
+            Some(0),
+            Some(total),
+            None,
+            format!(
+                "Preparing {} inference and {} encoding",
+                masker.provider().trim_end_matches("ExecutionProvider"),
+                video_encoder.label()
+            ),
+        );
+    }
 
     let mut decode_args = vec!["-hide_banner".into(), "-loglevel".into(), "error".into()];
     decode_args.extend(["-i".into(), input.to_string_lossy().into_owned()]);
@@ -581,7 +688,6 @@ fn process_video_with_masker(
         "-i".into(),
         "pipe:0".into(),
     ];
-    let (full_crf, full_preset) = encoding_profile(quality_mode);
     encode_args.extend(["-i".into(), input.to_string_lossy().into_owned()]);
     encode_args.extend(["-map".into(), "0:v:0".into()]);
     if meta.has_audio {
@@ -589,15 +695,10 @@ fn process_video_with_masker(
     } else {
         encode_args.push("-an".into());
     }
+    append_video_encoder_args(&mut encode_args, quality_mode, video_encoder);
     encode_args.extend([
-        "-c:v".into(),
-        "libx264".into(),
         "-pix_fmt".into(),
         "yuv420p".into(),
-        "-crf".into(),
-        full_crf.into(),
-        "-preset".into(),
-        full_preset.into(),
         "-fps_mode".into(),
         "cfr".into(),
         "-map_metadata".into(),
@@ -650,6 +751,7 @@ fn process_video_with_masker(
     };
     let frame_size = width as usize * height as usize * 3;
     let mut bytes = vec![0_u8; frame_size];
+    let mut composited = Vec::with_capacity(frame_size);
     let mut frame_count = 0_u64;
     let mut ewma: Option<f64> = None;
     let mut stabilizer = TemporalMaskStabilizer::default();
@@ -663,23 +765,25 @@ fn process_video_with_masker(
             Err(error) => break Err(format!("Could not decode video frame: {error}")),
         }
         let frame_started = Instant::now();
-        let image = match ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, bytes.clone()) {
-            Some(image) => image,
-            None => break Err("Could not construct video frame".into()),
-        };
-        let mut cutout = match masker.apply(
-            &DynamicImage::ImageRgb8(image),
-            edge_detail,
-            quality,
-            control,
-        ) {
+        let image =
+            match ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, std::mem::take(&mut bytes)) {
+                Some(image) => image,
+                None => break Err("Could not construct video frame".into()),
+            };
+        let frame = DynamicImage::ImageRgb8(image);
+        let mut cutout = match masker.apply(&frame, edge_detail, quality, control) {
             Ok(cutout) => cutout,
             Err(error) => break Err(error),
         };
-        if let Err(error) = stabilizer.apply(&bytes, &mut cutout) {
+        if let Err(error) = stabilizer.apply(frame.as_bytes(), &mut cutout) {
             break Err(error);
         }
-        let composited = composite_screen(&cutout, screen_color);
+        bytes = match frame {
+            DynamicImage::ImageRgb8(image) => image.into_raw(),
+            _ => unreachable!("video frames are decoded as RGB8"),
+        };
+        composite_screen_into(&cutout, screen_color, &mut composited);
+        masker.recycle_cutout(cutout);
         if let Err(error) = writer.write_all(&composited) {
             break Err(format!("Could not encode video frame: {error}"));
         }
@@ -696,7 +800,11 @@ fn process_video_with_masker(
                 Some(frame_count),
                 Some(total.max(frame_count)),
                 eta,
-                format!("Processing frame {frame_count} of {total}"),
+                format!(
+                    "Processing frame {frame_count} of {total} with {} and {}",
+                    masker.provider().trim_end_matches("ExecutionProvider"),
+                    video_encoder.label()
+                ),
             );
         }
     };
@@ -831,5 +939,18 @@ mod tests {
         assert_eq!(encoding_profile(QualityMode::Fast), ("23", "veryfast"));
         assert_eq!(encoding_profile(QualityMode::Balanced), ("18", "medium"));
         assert_eq!(encoding_profile(QualityMode::Maximum), ("16", "slow"));
+    }
+
+    #[test]
+    fn hardware_encoder_uses_nvenc_and_software_encoder_uses_x264() {
+        let mut hardware = Vec::new();
+        append_video_encoder_args(&mut hardware, QualityMode::Balanced, VideoEncoder::Nvidia);
+        assert!(hardware.iter().any(|value| value == "h264_nvenc"));
+        assert!(hardware.iter().any(|value| value == "p4"));
+
+        let mut software = Vec::new();
+        append_video_encoder_args(&mut software, QualityMode::Balanced, VideoEncoder::Software);
+        assert!(software.iter().any(|value| value == "libx264"));
+        assert!(software.iter().any(|value| value == "medium"));
     }
 }

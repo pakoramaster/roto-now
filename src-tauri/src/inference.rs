@@ -3,15 +3,16 @@ use crate::{
     models::{model_path, ModelId},
     routing::QualityMode,
 };
-use image::{imageops::FilterType, DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma};
+use image::{imageops::FilterType, DynamicImage, GenericImageView, GrayImage};
+#[cfg(test)]
+use image::{ImageBuffer, Luma};
 use ort::{
     ep,
     session::{RunOptions, Session},
-    value::Tensor,
+    value::TensorRef,
 };
 use parking_lot::Mutex;
 use std::{
-    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -28,10 +29,13 @@ const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const STD: [f32; 3] = [0.229, 0.224, 0.225];
 
 pub struct Masker {
-    session: Session,
+    session: Option<Session>,
     model_id: ModelId,
     provider: &'static str,
     model_path: PathBuf,
+    input_scratch: Vec<f32>,
+    mask_scratch: Vec<u8>,
+    rgba_scratch: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,7 +71,7 @@ struct CachedMasker {
 /// through inference also provides the mutable access required by ONNX Runtime.
 #[derive(Default)]
 pub struct ModelSessionCache {
-    entries: Mutex<HashMap<ModelId, CachedMasker>>,
+    active: Mutex<Option<CachedMasker>>,
 }
 
 impl ModelSessionCache {
@@ -80,34 +84,38 @@ impl ModelSessionCache {
         operation: impl FnOnce(&mut Masker, bool) -> Result<R, String>,
     ) -> Result<R, String> {
         let fingerprint = ModelFingerprint::read(path.clone())?;
-        let mut entries = self.entries.lock();
-        let reused = entries
-            .get(&model_id)
-            .is_some_and(|entry| entry.fingerprint == fingerprint);
+        let mut active = self.active.lock();
+        let reused = active.as_ref().is_some_and(|entry| {
+            entry.masker.model_id == model_id && entry.fingerprint == fingerprint
+        });
 
         if !reused {
-            // Drop a stale session before loading its replacement to avoid a
-            // large transient memory spike and to release its model file.
-            entries.remove(&model_id);
+            // Retain only the active model. DirectML sessions can reserve most
+            // of an 8 GB GPU, so keeping sessions for previously used models
+            // makes later GPU allocations much more likely to fail.
+            *active = None;
             on_load();
             let masker = Masker::load_from_path(path, model_id, prefer_directml)?;
-            entries.insert(
-                model_id,
-                CachedMasker {
-                    fingerprint,
-                    masker,
-                },
-            );
+            *active = Some(CachedMasker {
+                fingerprint,
+                masker,
+            });
         }
 
-        let entry = entries
-            .get_mut(&model_id)
+        let entry = active
+            .as_mut()
             .ok_or("The segmentation model cache was not initialized")?;
         operation(&mut entry.masker, reused)
     }
 
     pub fn invalidate(&self, model_id: ModelId) {
-        self.entries.lock().remove(&model_id);
+        let mut active = self.active.lock();
+        if active
+            .as_ref()
+            .is_some_and(|entry| entry.masker.model_id == model_id)
+        {
+            *active = None;
+        }
     }
 }
 
@@ -147,10 +155,13 @@ impl Masker {
             })();
             if let Ok(session) = directml {
                 return Ok(Self {
-                    session,
+                    session: Some(session),
                     model_id,
                     provider: "DmlExecutionProvider",
                     model_path: path,
+                    input_scratch: Vec::new(),
+                    mask_scratch: Vec::new(),
+                    rgba_scratch: Vec::new(),
                 });
             }
         }
@@ -174,15 +185,24 @@ impl Masker {
             )
         })?;
         Ok(Self {
-            session,
+            session: Some(session),
             model_id,
             provider: "CPUExecutionProvider",
             model_path: path,
+            input_scratch: Vec::new(),
+            mask_scratch: Vec::new(),
+            rgba_scratch: Vec::new(),
         })
     }
 
     pub fn provider(&self) -> &'static str {
         self.provider
+    }
+
+    pub fn recycle_cutout(&mut self, cutout: DynamicImage) {
+        if let DynamicImage::ImageRgba8(image) = cutout {
+            self.rgba_scratch = image.into_raw();
+        }
     }
 
     pub fn apply(
@@ -193,24 +213,30 @@ impl Masker {
         control: &JobControl,
     ) -> Result<DynamicImage, String> {
         let (width, height) = source.dimensions();
-        let source_rgb = source.to_rgb8();
+        let converted;
+        let source_rgb = if let Some(rgb) = source.as_rgb8() {
+            rgb
+        } else {
+            converted = source.to_rgb8();
+            &converted
+        };
         let quality = QualityMode::parse(quality)?;
         let resize_filter = if quality == QualityMode::Fast {
             FilterType::Triangle
         } else {
             FilterType::Lanczos3
         };
-        let rgb = image::imageops::resize(&source_rgb, INPUT_SIZE, INPUT_SIZE, resize_filter);
+        let rgb = image::imageops::resize(source_rgb, INPUT_SIZE, INPUT_SIZE, resize_filter);
         let divisor = if self.model_id == ModelId::Anime {
             255.0
         } else {
             rgb.as_raw().iter().copied().max().unwrap_or(1).max(1) as f32
         };
         let plane = (INPUT_SIZE * INPUT_SIZE) as usize;
-        let mut input = vec![0.0_f32; plane * 3];
+        self.input_scratch.resize(plane * 3, 0.0);
         for (index, pixel) in rgb.pixels().enumerate() {
             for channel in 0..3 {
-                input[channel * plane + index] =
+                self.input_scratch[channel * plane + index] =
                     (pixel[channel] as f32 / divisor - MEAN[channel]) / STD[channel];
             }
         }
@@ -218,23 +244,70 @@ impl Masker {
         if control.cancelled.load(Ordering::SeqCst) {
             return Err("cancelled".into());
         }
-        let mut mask = match run_session(&mut self.session, &input, control) {
+        let mut mask = match run_session(
+            self.session
+                .as_mut()
+                .ok_or("The inference session is unavailable")?,
+            &self.input_scratch,
+            control,
+        ) {
             Ok(mask) => mask,
             Err(error) if error != "cancelled" && self.provider == "DmlExecutionProvider" => {
-                let builder = Session::builder().map_err(|error| error.to_string())?;
-                let builder = builder
-                    .with_parallel_execution(false)
-                    .map_err(|error| error.to_string())?;
-                let mut builder = builder
-                    .with_memory_pattern(false)
-                    .map_err(|error| error.to_string())?;
-                self.session = builder
-                    .commit_from_file(&self.model_path)
-                    .map_err(|cpu_error| {
-                        format!("DirectML failed ({error}); CPU fallback also failed: {cpu_error}")
-                    })?;
-                self.provider = "CPUExecutionProvider";
-                run_session(&mut self.session, &input, control)?
+                // Release the failed GPU session before allocating the CPU
+                // replacement or retry. A concurrently initialized hardware
+                // codec can invalidate the D3D device; ONNX Runtime explicitly
+                // requires recreating the device in that case.
+                self.session.take();
+                let directml_retry: Result<(Session, Vec<f32>), String> = (|| {
+                    let builder = Session::builder().map_err(|error| error.to_string())?;
+                    let builder = builder
+                        .with_parallel_execution(false)
+                        .map_err(|error| error.to_string())?;
+                    let builder = builder
+                        .with_memory_pattern(false)
+                        .map_err(|error| error.to_string())?;
+                    let mut builder = builder
+                        .with_execution_providers([ep::DirectML::default().build()])
+                        .map_err(|error| error.to_string())?;
+                    let mut session = builder
+                        .commit_from_file(&self.model_path)
+                        .map_err(|error| error.to_string())?;
+                    let mask = run_session(&mut session, &self.input_scratch, control)?;
+                    Ok((session, mask))
+                })();
+                if let Ok((session, mask)) = directml_retry {
+                    self.session = Some(session);
+                    mask
+                } else {
+                    let retry_error = directml_retry
+                        .err()
+                        .unwrap_or_else(|| "unknown DirectML retry failure".into());
+                    eprintln!(
+                        "DirectML inference failed and device recreation did not recover it; switching to CPU: {error}; retry: {retry_error}"
+                    );
+                    let builder = Session::builder().map_err(|error| error.to_string())?;
+                    let builder = builder
+                        .with_parallel_execution(false)
+                        .map_err(|error| error.to_string())?;
+                    let mut builder = builder
+                        .with_memory_pattern(false)
+                        .map_err(|error| error.to_string())?;
+                    self.session = Some(builder.commit_from_file(&self.model_path).map_err(
+                        |cpu_error| {
+                            format!(
+                                "DirectML failed ({error}); CPU fallback also failed: {cpu_error}"
+                            )
+                        },
+                    )?);
+                    self.provider = "CPUExecutionProvider";
+                    run_session(
+                        self.session
+                            .as_mut()
+                            .ok_or("The inference session is unavailable")?,
+                        &self.input_scratch,
+                        control,
+                    )?
+                }
             }
             Err(error) => return Err(error),
         };
@@ -259,18 +332,33 @@ impl Masker {
             }
         }
 
-        let raw: Vec<u8> = mask
-            .into_iter()
-            .map(|value| (value.clamp(0.0, 1.0) * 255.0) as u8)
-            .collect();
-        let small = GrayImage::from_raw(INPUT_SIZE, INPUT_SIZE, raw)
-            .ok_or("Could not construct output mask")?;
+        self.mask_scratch.clear();
+        self.mask_scratch.extend(
+            mask.into_iter()
+                .map(|value| (value.clamp(0.0, 1.0) * 255.0) as u8),
+        );
+        let small = GrayImage::from_raw(
+            INPUT_SIZE,
+            INPUT_SIZE,
+            std::mem::take(&mut self.mask_scratch),
+        )
+        .ok_or("Could not construct output mask")?;
         let resized = image::imageops::resize(&small, width, height, resize_filter);
-        let alpha = refine_alpha(&resized, edge_detail);
-        let mut rgba = source.to_rgba8();
-        for (pixel, alpha) in rgba.pixels_mut().zip(alpha.pixels()) {
-            pixel.0[3] = alpha.0[0];
+        self.mask_scratch = small.into_raw();
+        self.rgba_scratch
+            .resize(width as usize * height as usize * 4, 0);
+        for ((output, source), alpha) in self
+            .rgba_scratch
+            .chunks_exact_mut(4)
+            .zip(source_rgb.as_raw().chunks_exact(3))
+            .zip(resized.as_raw())
+        {
+            output[..3].copy_from_slice(source);
+            output[3] = refine_alpha_value(*alpha, edge_detail);
         }
+        let rgba =
+            image::RgbaImage::from_raw(width, height, std::mem::take(&mut self.rgba_scratch))
+                .ok_or("Could not construct RGBA cutout")?;
         Ok(DynamicImage::ImageRgba8(rgba))
     }
 }
@@ -280,9 +368,11 @@ fn run_session(
     input: &[f32],
     control: &JobControl,
 ) -> Result<Vec<f32>, String> {
-    let tensor = Tensor::from_array((
+    // Borrow the reusable CHW buffer directly. Tensor::from_array would copy
+    // about 12 MiB for every 1024x1024 RGB inference.
+    let tensor = TensorRef::from_array_view((
         [1_usize, 3, INPUT_SIZE as usize, INPUT_SIZE as usize],
-        input.to_vec().into_boxed_slice(),
+        input,
     ))
     .map_err(|error| format!("Could not prepare inference input: {error}"))?;
     let run_options = Arc::new(
@@ -300,12 +390,13 @@ fn run_session(
                     let _ = options.terminate();
                     break;
                 }
-                thread::sleep(Duration::from_millis(10));
+                thread::park_timeout(Duration::from_millis(10));
             }
         })
     };
     let output_result = session.run_with_options(ort::inputs![tensor], &run_options);
     watcher_done.store(true, Ordering::Release);
+    watcher.thread().unpark();
     let _ = watcher.join();
     let outputs = output_result.map_err(|error| {
         if control.cancelled.load(Ordering::SeqCst) {
@@ -320,21 +411,24 @@ fn run_session(
     Ok(values.to_vec())
 }
 
+#[cfg(test)]
 fn refine_alpha(alpha: &GrayImage, edge_detail: u8) -> GrayImage {
-    let strength = 0.72 + (edge_detail.min(100) as f32 / 100.0) * 0.72;
     ImageBuffer::from_fn(alpha.width(), alpha.height(), |x, y| {
-        let original = alpha.get_pixel(x, y).0[0];
-        let refined = if original <= 2 {
-            0
-        } else if original >= 253 {
-            255
-        } else {
-            let normalized = (original as f32 / 255.0).clamp(1e-4, 1.0 - 1e-4);
-            let logit = (normalized / (1.0 - normalized)).ln();
-            ((1.0 / (1.0 + (-logit * strength).exp())) * 255.0).clamp(0.0, 255.0) as u8
-        };
-        Luma([refined])
+        Luma([refine_alpha_value(alpha.get_pixel(x, y).0[0], edge_detail)])
     })
+}
+
+fn refine_alpha_value(original: u8, edge_detail: u8) -> u8 {
+    if original <= 2 {
+        return 0;
+    }
+    if original >= 253 {
+        return 255;
+    }
+    let strength = 0.72 + (edge_detail.min(100) as f32 / 100.0) * 0.72;
+    let normalized = (original as f32 / 255.0).clamp(1e-4, 1.0 - 1e-4);
+    let logit = (normalized / (1.0 - normalized)).ln();
+    ((1.0 / (1.0 + (-logit * strength).exp())) * 255.0).clamp(0.0, 255.0) as u8
 }
 
 pub fn save_cutout(image: &DynamicImage, path: &Path) -> Result<(), String> {
@@ -344,23 +438,27 @@ pub fn save_cutout(image: &DynamicImage, path: &Path) -> Result<(), String> {
 }
 
 pub fn composite_screen(cutout: &DynamicImage, screen_color: &str) -> Vec<u8> {
+    let mut output = Vec::with_capacity(cutout.width() as usize * cutout.height() as usize * 3);
+    composite_screen_into(cutout, screen_color, &mut output);
+    output
+}
+
+pub fn composite_screen_into(cutout: &DynamicImage, screen_color: &str, output: &mut Vec<u8>) {
     let background = if screen_color == "blue" {
         [0, 71, 187]
     } else {
         [0, 177, 64]
     };
-    cutout
-        .to_rgba8()
-        .pixels()
-        .flat_map(|pixel| {
-            let alpha = pixel[3] as f32 / 255.0;
-            [
-                (pixel[0] as f32 * alpha + background[0] as f32 * (1.0 - alpha)) as u8,
-                (pixel[1] as f32 * alpha + background[1] as f32 * (1.0 - alpha)) as u8,
-                (pixel[2] as f32 * alpha + background[2] as f32 * (1.0 - alpha)) as u8,
-            ]
-        })
-        .collect()
+    output.clear();
+    output.reserve(cutout.width() as usize * cutout.height() as usize * 3);
+    for pixel in cutout.as_rgba8().expect("cutouts are RGBA").pixels() {
+        let alpha = pixel[3] as f32 / 255.0;
+        output.extend_from_slice(&[
+            (pixel[0] as f32 * alpha + background[0] as f32 * (1.0 - alpha)) as u8,
+            (pixel[1] as f32 * alpha + background[1] as f32 * (1.0 - alpha)) as u8,
+            (pixel[2] as f32 * alpha + background[2] as f32 * (1.0 - alpha)) as u8,
+        ]);
+    }
 }
 
 #[cfg(test)]

@@ -196,7 +196,7 @@ fn status_for(app: &AppHandle, item: &'static ModelSpec) -> ModelStatus {
             "missing"
         },
         provider: if item.id == ModelId::General {
-            "CPU fallback"
+            "CPU / NVENC for video"
         } else {
             "DirectML / CPU"
         },
