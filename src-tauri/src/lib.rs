@@ -253,9 +253,15 @@ fn start_image_job(
                         None,
                         None,
                         if reused {
-                            "Using loaded model to remove background"
+                            format!(
+                                "Using loaded model with {}",
+                                masker.provider().trim_end_matches("ExecutionProvider")
+                            )
                         } else {
-                            "Removing background"
+                            format!(
+                                "Removing background with {}",
+                                masker.provider().trim_end_matches("ExecutionProvider")
+                            )
                         },
                     );
                     let cutout = masker.apply(&source, edge_detail, &quality, &control)?;

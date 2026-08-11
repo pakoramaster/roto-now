@@ -8,6 +8,7 @@ const HISTORY_STRENGTH: f32 = 0.58;
 pub struct TemporalMaskStabilizer {
     previous_rgb: Vec<u8>,
     previous_alpha: Vec<u8>,
+    current_alpha: Vec<u8>,
 }
 
 impl TemporalMaskStabilizer {
@@ -20,7 +21,9 @@ impl TemporalMaskStabilizer {
             return Err("Temporal stabilization received a mismatched video frame".into());
         }
 
-        let current_alpha: Vec<u8> = rgba.pixels().map(|pixel| pixel[3]).collect();
+        self.current_alpha.clear();
+        self.current_alpha
+            .extend(rgba.pixels().map(|pixel| pixel[3]));
         let reset = self.previous_rgb.len() != rgb.len()
             || self.previous_alpha.len() != pixel_count
             || frame_delta(&self.previous_rgb, rgb) >= SCENE_CUT_THRESHOLD;
@@ -28,7 +31,7 @@ impl TemporalMaskStabilizer {
         if reset {
             self.previous_rgb.clear();
             self.previous_rgb.extend_from_slice(rgb);
-            self.previous_alpha = current_alpha;
+            self.previous_alpha.clone_from(&self.current_alpha);
             return Ok(());
         }
 
@@ -40,10 +43,10 @@ impl TemporalMaskStabilizer {
                 / 3.0;
             let similarity = (1.0 - color_delta / MOTION_RANGE).clamp(0.0, 1.0);
             let alpha_delta =
-                u8::abs_diff(current_alpha[index], self.previous_alpha[index]) as f32 / 255.0;
+                u8::abs_diff(self.current_alpha[index], self.previous_alpha[index]) as f32 / 255.0;
             let agreement = 1.0 - alpha_delta * 0.55;
             let history_weight = HISTORY_STRENGTH * similarity * similarity * agreement;
-            let stabilized = current_alpha[index] as f32 * (1.0 - history_weight)
+            let stabilized = self.current_alpha[index] as f32 * (1.0 - history_weight)
                 + self.previous_alpha[index] as f32 * history_weight;
             pixel[3] = stabilized.round().clamp(0.0, 255.0) as u8;
             self.previous_alpha[index] = pixel[3];
