@@ -35,6 +35,10 @@ struct ProbeStream {
     duration: Option<String>,
     nb_frames: Option<String>,
     sample_aspect_ratio: Option<String>,
+    color_range: Option<String>,
+    color_space: Option<String>,
+    color_transfer: Option<String>,
+    color_primaries: Option<String>,
     tags: Option<ProbeTags>,
     side_data_list: Option<Vec<ProbeSideData>>,
     disposition: Option<ProbeDisposition>,
@@ -63,6 +67,133 @@ struct VideoMeta {
     duration: f64,
     frames: u64,
     has_audio: bool,
+    color: ColorSpec,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ColorSpec {
+    range: String,
+    space: String,
+    transfer: String,
+    primaries: String,
+    filter_matrix: String,
+}
+
+fn supported_color_value(value: Option<&str>, supported: &[&str], fallback: &str) -> String {
+    value
+        .filter(|candidate| supported.contains(candidate))
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+fn color_spec(video: &ProbeStream, width: u32, height: u32) -> ColorSpec {
+    // When an SDR source is untagged, use the conventional SD/HD defaults.
+    // Explicit tags always win, and are written back to the encoded stream.
+    let hd = width >= 1280 || height > 576;
+    let default_space = if hd { "bt709" } else { "smpte170m" };
+    let space = supported_color_value(
+        video.color_space.as_deref(),
+        &[
+            "bt709",
+            "fcc",
+            "bt470bg",
+            "smpte170m",
+            "smpte240m",
+            "bt2020nc",
+            "bt2020c",
+        ],
+        default_space,
+    );
+    let filter_matrix = match space.as_str() {
+        "bt470bg" | "smpte170m" => "bt601",
+        "bt2020nc" | "bt2020c" => "bt2020",
+        value => value,
+    }
+    .to_string();
+    ColorSpec {
+        range: supported_color_value(video.color_range.as_deref(), &["tv", "pc"], "tv"),
+        transfer: supported_color_value(
+            video.color_transfer.as_deref(),
+            &[
+                "bt709",
+                "gamma22",
+                "gamma28",
+                "smpte170m",
+                "smpte240m",
+                "linear",
+                "iec61966-2-4",
+                "bt1361e",
+                "iec61966-2-1",
+                "bt2020-10",
+                "bt2020-12",
+            ],
+            "bt709",
+        ),
+        primaries: supported_color_value(
+            video.color_primaries.as_deref(),
+            &[
+                "bt709",
+                "bt470m",
+                "bt470bg",
+                "smpte170m",
+                "smpte240m",
+                "film",
+                "bt2020",
+                "smpte428",
+                "smpte431",
+                "smpte432",
+            ],
+            if hd { "bt709" } else { "smpte170m" },
+        ),
+        space,
+        filter_matrix,
+    }
+}
+
+fn scale_to_rgb_filter(width: u32, height: u32, color: &ColorSpec) -> String {
+    format!(
+        "scale={width}:{height}:flags=lanczos:in_range={}:out_range=pc:in_color_matrix={},setsar=1",
+        color.range, color.filter_matrix
+    )
+}
+
+fn rgb_to_yuv_filter(color: &ColorSpec) -> String {
+    format!(
+        "scale=in_range=pc:out_range={}:out_color_matrix={},format=yuv420p",
+        color.range, color.filter_matrix
+    )
+}
+
+fn append_color_args(args: &mut Vec<String>, color: &ColorSpec, encoder: VideoEncoder) {
+    args.extend([
+        "-color_range".into(),
+        color.range.clone(),
+        "-colorspace".into(),
+        color.space.clone(),
+        "-color_trc".into(),
+        color.transfer.clone(),
+        "-color_primaries".into(),
+        color.primaries.clone(),
+    ]);
+    if encoder == VideoEncoder::Software {
+        // FFmpeg's generic color options do not currently propagate primaries
+        // and transfer characteristics into libx264's H.264 VUI. Supply the
+        // equivalent x264 parameters so players receive all four properties.
+        let transfer = match color.transfer.as_str() {
+            "gamma22" => "bt470m",
+            "gamma28" => "bt470bg",
+            value => value,
+        };
+        args.extend([
+            "-x264-params".into(),
+            format!(
+                "colorprim={}:transfer={transfer}:colormatrix={}:fullrange={}",
+                color.primaries,
+                color.space,
+                if color.range == "pc" { "on" } else { "off" }
+            ),
+        ]);
+    }
 }
 
 fn developer_binary(name: &str) -> PathBuf {
@@ -277,6 +408,7 @@ fn probe(ffprobe: &Path, source: &Path) -> Result<VideoMeta, String> {
         parse_aspect_ratio(video.sample_aspect_ratio.as_deref()),
         rotation,
     );
+    let color = color_spec(video, width, height);
     let (fps_arg, fps) = select_frame_rate(
         video.avg_frame_rate.as_deref(),
         video.r_frame_rate.as_deref(),
@@ -312,6 +444,7 @@ fn probe(ffprobe: &Path, source: &Path) -> Result<VideoMeta, String> {
             .streams
             .iter()
             .any(|stream| stream.codec_type.as_deref() == Some("audio")),
+        color,
     })
 }
 
@@ -524,7 +657,7 @@ fn process_preview_frame(
             "-frames:v",
             "1",
             "-vf",
-            &format!("scale={width}:{height}:flags=lanczos,setsar=1"),
+            &scale_to_rgb_filter(width, height, &meta.color),
             "-an",
             "-f",
             "rawvideo",
@@ -646,8 +779,9 @@ fn process_video_with_masker(
     let mut decode_args = vec!["-hide_banner".into(), "-loglevel".into(), "error".into()];
     decode_args.extend(["-i".into(), input.to_string_lossy().into_owned()]);
     let decode_filter = format!(
-        "fps={},scale={width}:{height}:flags=lanczos,setsar=1",
-        meta.fps_arg
+        "fps={},{}",
+        meta.fps_arg,
+        scale_to_rgb_filter(width, height, &meta.color)
     );
     decode_args.extend([
         "-vf".into(),
@@ -696,6 +830,7 @@ fn process_video_with_masker(
         encode_args.push("-an".into());
     }
     append_video_encoder_args(&mut encode_args, quality_mode, video_encoder);
+    encode_args.extend(["-vf".into(), rgb_to_yuv_filter(&meta.color)]);
     encode_args.extend([
         "-pix_fmt".into(),
         "yuv420p".into(),
@@ -708,6 +843,7 @@ fn process_video_with_masker(
         "-movflags".into(),
         "+faststart".into(),
     ]);
+    append_color_args(&mut encode_args, &meta.color, video_encoder);
     if meta.has_audio {
         encode_args.extend([
             "-c:a".into(),
@@ -920,6 +1056,10 @@ mod tests {
             duration: Some("1".into()),
             nb_frames: Some("30".into()),
             sample_aspect_ratio: Some("1:1".into()),
+            color_range: None,
+            color_space: None,
+            color_transfer: None,
+            color_primaries: None,
             tags: None,
             side_data_list: Some(vec![ProbeSideData {
                 rotation: Some(-90.0),
@@ -952,5 +1092,62 @@ mod tests {
         append_video_encoder_args(&mut software, QualityMode::Balanced, VideoEncoder::Software);
         assert!(software.iter().any(|value| value == "libx264"));
         assert!(software.iter().any(|value| value == "medium"));
+    }
+
+    #[test]
+    fn source_color_tags_are_preserved_in_conversion_and_output_args() {
+        let stream = ProbeStream {
+            codec_type: Some("video".into()),
+            width: Some(1920),
+            height: Some(1080),
+            avg_frame_rate: None,
+            r_frame_rate: None,
+            duration: None,
+            nb_frames: None,
+            sample_aspect_ratio: None,
+            color_range: Some("pc".into()),
+            color_space: Some("bt709".into()),
+            color_transfer: Some("bt709".into()),
+            color_primaries: Some("bt709".into()),
+            tags: None,
+            side_data_list: None,
+            disposition: None,
+        };
+        let color = color_spec(&stream, 1920, 1080);
+        assert_eq!(color.range, "pc");
+        assert!(scale_to_rgb_filter(1920, 1080, &color).contains("in_color_matrix=bt709"));
+        assert!(rgb_to_yuv_filter(&color).contains("out_range=pc"));
+
+        let mut args = Vec::new();
+        append_color_args(&mut args, &color, VideoEncoder::Software);
+        assert!(args.windows(2).any(|pair| pair == ["-colorspace", "bt709"]));
+        assert!(args.windows(2).any(|pair| pair == ["-color_range", "pc"]));
+        assert!(args
+            .iter()
+            .any(|argument| argument
+                == "colorprim=bt709:transfer=bt709:colormatrix=bt709:fullrange=on"));
+    }
+
+    #[test]
+    fn untagged_sdr_uses_conventional_sd_and_hd_matrices() {
+        let stream = ProbeStream {
+            codec_type: Some("video".into()),
+            width: None,
+            height: None,
+            avg_frame_rate: None,
+            r_frame_rate: None,
+            duration: None,
+            nb_frames: None,
+            sample_aspect_ratio: None,
+            color_range: None,
+            color_space: None,
+            color_transfer: None,
+            color_primaries: None,
+            tags: None,
+            side_data_list: None,
+            disposition: None,
+        };
+        assert_eq!(color_spec(&stream, 1920, 1080).space, "bt709");
+        assert_eq!(color_spec(&stream, 720, 480).filter_matrix, "bt601");
     }
 }
