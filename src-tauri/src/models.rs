@@ -75,6 +75,10 @@ pub const MODEL_SPECS: [ModelSpec; 3] = [
     },
 ];
 
+pub const GENERAL_LITE_FP16_FILE: &str = "birefnet-general-lite-fp16.onnx";
+pub const GENERAL_LITE_FP16_SHA256: &str =
+    "311cfd8088ee71224ba0687b00dfad1ed28fc05aae0ce64e87965cc3d4b29d6a";
+
 pub fn spec(id: ModelId) -> &'static ModelSpec {
     MODEL_SPECS
         .iter()
@@ -107,6 +111,12 @@ pub fn model_path(app: &AppHandle, id: ModelId) -> Result<PathBuf, String> {
     Ok(managed)
 }
 
+pub fn accelerated_model_path(model_path: &Path, id: ModelId) -> Option<PathBuf> {
+    (id == ModelId::GeneralLite)
+        .then(|| model_path.with_file_name(GENERAL_LITE_FP16_FILE))
+        .filter(|path| path.is_file())
+}
+
 fn managed_model_path(app: &AppHandle, id: ModelId) -> Result<PathBuf, String> {
     Ok(model_root(app)?.join(spec(id).file))
 }
@@ -127,44 +137,69 @@ fn development_model_path_from_root(root: &Path, id: ModelId) -> PathBuf {
     root.join(folder).join(spec(id).file)
 }
 
-fn seed_bundled_general_lite(app: &AppHandle) -> Result<(), String> {
-    let root = model_root(app)?;
-    let marker = root.join(".bundled-general-lite-seeded");
-    if marker.is_file() {
+fn seed_bundled_file(
+    root: &Path,
+    resources: &Path,
+    file: &str,
+    expected_sha256: &str,
+    label: &str,
+) -> Result<(), String> {
+    let bundled = resources.join("models").join(file);
+    if !bundled.is_file() {
         return Ok(());
     }
 
-    let destination = root.join(spec(ModelId::GeneralLite).file);
-    if destination.is_file() && sha256_file(&destination)? == spec(ModelId::GeneralLite).sha256 {
+    let destination = root.join(file);
+    let marker = root.join(format!(
+        ".bundled-{}-{}-seeded",
+        file.trim_end_matches(".onnx"),
+        &expected_sha256[..12]
+    ));
+    if marker.is_file() && destination.is_file() {
+        return Ok(());
+    }
+    if destination.is_file() && sha256_file(&destination)? == expected_sha256 {
         std::fs::write(marker, b"1")
             .map_err(|error| format!("Could not finish bundled model setup: {error}"))?;
         return Ok(());
     }
-
-    let bundled = app
-        .path()
-        .resource_dir()
-        .map_err(|error| format!("Could not locate bundled resources: {error}"))?
-        .join("models")
-        .join(spec(ModelId::GeneralLite).file);
-    if !bundled.is_file() {
-        return Ok(());
-    }
-    if sha256_file(&bundled)? != spec(ModelId::GeneralLite).sha256 {
-        return Err("The bundled General Lite model failed checksum verification".into());
+    if sha256_file(&bundled)? != expected_sha256 {
+        return Err(format!(
+            "The bundled {label} model failed checksum verification"
+        ));
     }
 
     let partial = destination.with_extension("onnx.part");
     std::fs::copy(&bundled, &partial)
-        .map_err(|error| format!("Could not install bundled General Lite: {error}"))?;
-    if sha256_file(&partial)? != spec(ModelId::GeneralLite).sha256 {
+        .map_err(|error| format!("Could not install bundled {label}: {error}"))?;
+    if sha256_file(&partial)? != expected_sha256 {
         let _ = std::fs::remove_file(&partial);
-        return Err("The installed General Lite copy failed checksum verification".into());
+        return Err(format!(
+            "The installed {label} copy failed checksum verification"
+        ));
     }
     atomic_replace(&partial, &destination)?;
     std::fs::write(marker, b"1")
         .map_err(|error| format!("Could not finish bundled model setup: {error}"))?;
     Ok(())
+}
+
+fn seed_bundled_models(app: &AppHandle) -> Result<(), String> {
+    let root = model_root(app)?;
+    let resources = app
+        .path()
+        .resource_dir()
+        .map_err(|error| format!("Could not locate bundled resources: {error}"))?;
+    for item in MODEL_SPECS.iter() {
+        seed_bundled_file(&root, &resources, item.file, item.sha256, item.name)?;
+    }
+    seed_bundled_file(
+        &root,
+        &resources,
+        GENERAL_LITE_FP16_FILE,
+        GENERAL_LITE_FP16_SHA256,
+        "FP16 General Lite",
+    )
 }
 
 fn status_for(app: &AppHandle, item: &'static ModelSpec) -> ModelStatus {
@@ -205,7 +240,7 @@ fn status_for(app: &AppHandle, item: &'static ModelSpec) -> ModelStatus {
 
 #[tauri::command]
 pub fn get_bootstrap_status(app: AppHandle) -> Result<BootstrapStatus, String> {
-    seed_bundled_general_lite(&app)?;
+    seed_bundled_models(&app)?;
     let models: Vec<_> = MODEL_SPECS
         .iter()
         .map(|item| status_for(&app, item))
@@ -430,6 +465,9 @@ pub fn download_model(
                         output_path: String::new(),
                         model: item.name.into(),
                         provider: "installed".into(),
+                        precision: "n/a".into(),
+                        pipeline: "model download".into(),
+                        performance: None,
                         duration_ms: 0,
                         frame_count: None,
                         width: None,
@@ -481,7 +519,7 @@ mod tests {
         for model in MODEL_SPECS.iter() {
             assert_eq!(model.sha256.len(), 64);
             assert!(model.sha256.bytes().all(|value| value.is_ascii_hexdigit()));
-            assert!(model.size > 200_000_000);
+            assert!(model.size > 10_000_000);
         }
     }
 

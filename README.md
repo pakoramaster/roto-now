@@ -1,35 +1,106 @@
-# Roto Now
+<div align="center">
+  <img src="src-tauri/icons/128x128.png" width="96" alt="Roto Now icon">
 
-Roto Now is a Windows-first Tauri desktop app for fully local AI-assisted rotoscoping and background removal.
+  # Roto Now
 
-## Beta scope
+  Remove image and video backgrounds locally on Windows.
 
-- Images produce transparent PNG results.
-- Videos produce green- or blue-screen H.264 MP4 files with source audio.
-- Video exports normalize variable-rate inputs to a source-derived constant frame rate, apply rotation and pixel-aspect metadata, guarantee even square-pixel dimensions, resynchronize the first audio track, and write fast-start MP4 metadata. Completed exports are probed again for dimensions, duration, and audio before the app reports success.
-- Video preview processes one still frame at the current playhead and is capped at 1280×720.
-- General Lite is bundled in the installer and copied into the per-user app-data directory on first run. General Maximum and Anime remain verified on-demand downloads.
-- Native Rust runs pinned `ort`/ONNX Runtime inference with DirectML and automatic CPU fallback.
-- Pinned FFmpeg 8.1.2 `ffmpeg.exe` and `ffprobe.exe` are packaged in the NSIS installer. End users need no Python, Node, Rust, or separate FFmpeg install.
-- One foreground job runs at a time. Image/model phases use indeterminate progress; downloads use bytes; videos use frames and show ETA after three frames.
-- Video masks use motion-aware temporal smoothing to reduce frame-to-frame edge flicker. Stabilization resets on scene cuts and moving pixels favor the current mask; this is lightweight mask propagation rather than full object tracking.
-- Image cutouts can be refined before saving with adjustable Restore and Erase brushes, including undo, clear, and feathered native mask application.
-- Users explicitly choose General for photos and objects or Anime for stylized artwork.
-- Fast uses General Lite with quicker mask resampling and faster video encoding, Balanced uses General Lite with detailed resampling and balanced encoding, and Maximum uses General Maximum with the highest-quality video encode profile.
-- The desktop interface includes keyboard-visible focus states, responsive layouts, and an in-app Help & About panel with runtime details.
+  No account, no uploads, and no separate Python or FFmpeg setup.
+</div>
 
-Before publishing a beta build, complete the [beta release checklist](docs/BETA_CHECKLIST.md).
+> **Beta:** The main image and video workflows are usable. General and Anime video use motion-aware temporal stabilization. See [Current limitations](#current-limitations) before production work.
 
-## Development
+---
 
-Install Node.js, Rust, and Visual Studio Build Tools with the **Desktop development with C++** workload and a Windows SDK, then run:
+## What it does
+
+### Images
+
+- Open PNG, JPG, or WebP files.
+- Remove the background and preview the transparent result.
+- Restore or erase parts of the mask with a feathered brush.
+- Save the finished cutout as a transparent PNG.
+
+### Videos
+
+- Open MP4, MOV, or WebM files.
+- Preview one processed frame before committing to a full export.
+- Export an H.264 MP4 with a green or blue background.
+- Keep the source audio, orientation, aspect ratio, and practical playback timing.
+- Smooth masks between nearby frames and guard against brief full-screen colour flashes.
+
+Everything is processed on your computer. The only optional network activity is downloading AI models from the in-app model manager.
+
+---
+
+## Install
+
+Download the latest Windows installer from the [Releases page](https://github.com/pakoramaster/roto-now/releases).
+
+Roto Now includes the General Lite model and FFmpeg, so a normal install does not require Node.js, Python, Rust, an account, or a separate FFmpeg download.
+
+Windows may show a SmartScreen warning while beta installers are unsigned. Check the release notes and published SHA-256 value before continuing.
+
+---
+
+## Quick start
+
+1. Open Roto Now and choose **Browse files**.
+2. Pick **General** for people, animals, products, and photos, or **Anime** for illustrations and line art.
+3. Choose a quality mode. **Balanced** is the best starting point for most work.
+4. For video, move the playhead and use **Preview frame** to check the mask and screen colour.
+5. Select **Remove background** or **Process full video**.
+6. Compare **Input** and **Output**, make brush corrections to images if needed, then save the result.
+
+Your original file is never overwritten. Roto Now creates a temporary result first and only opens a Save dialog after processing succeeds.
+
+## Choosing settings
+
+| Setting | Best for | Trade-off |
+| --- | --- | --- |
+| **Fast** | Quick drafts and longer videos | Fastest resampling and export; softer fine edges |
+| **Balanced** | Most images and videos | Good edge detail with a faster practical export |
+| **Maximum** | Difficult stills and short quality-focused clips | Larger model and slower, higher-quality processing |
+| **Edge detail** | Hair, fur, and soft boundaries | Higher values preserve more soft detail but may retain background haze |
+| **Green / Blue** | Video editing and keying | Choose the colour least present in the subject |
+
+**General Lite** ships with the app and powers Fast and Balanced. Its DirectML path uses mixed-precision weights and automatically falls back to the original FP32 model on CPU. **General Maximum** and **Anime** can be installed when needed from the model manager.
+
+## Tips for better results
+
+- Use footage with a clear subject and reasonable contrast from the background.
+- Preview a representative video frame before processing the full clip.
+- Start with Balanced and the default edge detail, then adjust only if the boundary looks too hard or too hazy.
+- Choose blue screen when the subject contains green clothing or props, and green screen when the subject contains blue.
+- Use the Restore and Erase brushes for small image corrections instead of rerunning the whole image repeatedly.
+
+## Current limitations
+
+- Windows is the supported desktop platform during beta.
+- General and Anime still infer each frame independently before the video-native temporal matte stage; they do not perform object tracking.
+- Fast motion, motion blur, transparent objects, fine flyaway hair, and low subject/background contrast can still produce unstable edges.
+- Video output uses a solid green or blue screen because common H.264 MP4 playback does not support transparent alpha video.
+- One processing or model-download job runs at a time.
+
+---
+
+## Build from source
+
+### Requirements
+
+- Node.js
+- Rust
+- Visual Studio Build Tools with **Desktop development with C++** and a Windows SDK
+- Python only when regenerating the packaged FP16 General Lite model
+
+From the repository root in PowerShell:
 
 ```powershell
 npm install
 .\scripts\tauri-dev.ps1
 ```
 
-The development script downloads and verifies the pinned FFmpeg binaries. It also sets `ROTO_NOW_MODEL_ROOT` to the ignored `.models/` reference-model directory. Debug builds use managed app-data models first, then fall back to these local test paths when present:
+The development script downloads and verifies the pinned FFmpeg build and configures the project-local Rust environment. It also exposes ignored reference models under `.models/` when they are available:
 
 ```text
 .models/rembg/birefnet-general-lite.onnx
@@ -37,13 +108,20 @@ The development script downloads and verifies the pinned FFmpeg binaries. It als
 .models/toonout/birefnet-toonout-fp16.onnx
 ```
 
-Fallback weights appear as **Local** in the model manager and cannot be removed or overwritten from the app. Release builds ignore `ROTO_NOW_MODEL_ROOT`; optional production models still use verified app-managed downloads. Python workers under `backend/` remain parity references and are not shipped.
+Release builds do not use these developer fallback paths. Optional production models are stored in Roto Now's per-user app-data folder.
 
-## Testing
+## Project structure
 
-### Automated checks
+```text
+src/             React and TypeScript interface
+src-tauri/       Rust processing, ONNX inference, FFmpeg, and Tauri commands
+scripts/         Development, asset-fetching, and release checks
+docs/            Beta release checklist and project notes
+```
 
-Run the frontend production build and native Rust tests from the repository root:
+## Checks
+
+Run the frontend and native checks from the repository root:
 
 ```powershell
 npm.cmd run build
@@ -52,98 +130,31 @@ $env:CARGO_HOME = Join-Path (Get-Location) ".toolchains\cargo"
 $env:RUSTUP_HOME = Join-Path (Get-Location) ".toolchains\rustup"
 $env:Path = "$(Join-Path $env:CARGO_HOME 'bin');$env:Path"
 
-cargo test --manifest-path src-tauri\Cargo.toml
-
-./scripts/verify-release.ps1
+cargo test --manifest-path src-tauri\Cargo.toml --locked
+.\scripts\verify-release.ps1
 ```
 
-Pull requests and pushes to `main` run the same frontend build, locked Rust test suite, and release-configuration checks on GitHub Actions.
+Processing changes should also be checked manually with a general photo, an anime image when relevant, and a short video that contains audio. Maintainers should complete the [beta release checklist](docs/BETA_CHECKLIST.md) before publishing an installer.
 
-After Python reference-worker changes, also run:
+## Packaging
+
+Fetch the pinned bundle assets and build the Windows NSIS installer:
 
 ```powershell
-& ".\.python-env\Scripts\python.exe" -m py_compile backend\worker.py backend\video_worker.py
-```
-
-### Interactive app test
-
-Start the development app with:
-
-```powershell
-.\scripts\tauri-dev.ps1
-```
-
-Use **Browse files** to test each workflow:
-
-1. Process a general photograph and confirm the Output preview has transparency, Restore/Erase corrections work, and the saved PNG opens correctly.
-2. Process a stylized or anime image with **Anime**, then process a photograph with **General** and confirm the result summary reports the selected model.
-3. Process short constant- and variable-frame-rate videos with audio. Include a phone clip carrying 90° rotation metadata and, when available, a non-square-pixel or odd-dimension source. Confirm the preview is one processed frame at the current playhead and the full MP4 is upright, square-pixel, even-dimensioned, duration-matched, audible, and immediately seekable when opened; also verify green/blue output selection.
-4. Inspect detailed moving edges for reduced flicker and confirm scene cuts reset stabilization cleanly.
-5. Compare **Fast**, **Balanced**, and **Maximum**. Maximum should report General Maximum; Fast and Balanced should report General Lite and use visibly different encoding profiles for video.
-6. Cancel a model download, image job, and video job and confirm the app returns to a usable state without presenting a partial result as complete.
-
-### Testing local optional models
-
-When the ignored `.models/` paths listed above exist, `tauri-dev.ps1` exposes them automatically. Open the model manager and confirm General Maximum and Anime show **Local**, then select them normally in the app. No copy or download command is required.
-
-Verify the local files against the pinned hashes:
-
-```powershell
-Get-FileHash ".models\rembg\birefnet-general.onnx" -Algorithm SHA256
-Get-FileHash ".models\toonout\birefnet-toonout-fp16.onnx" -Algorithm SHA256
-```
-
-Expected hashes:
-
-```text
-General Maximum: 58F621F00F5D756097615970A88A791584600DCF7C45B18A0A6267535A1EBD3C
-Anime ToonOut:   213A8A98EE426EF8F02D247EB5A5A9889359E37C2E1E7E31E282D61034D08A83
-```
-
-To smoke-test each optional model directly, reuse the Rust environment variables from the automated-check section, replace the input paths with suitable images, and run:
-
-```powershell
-$testOutput = Join-Path $env:TEMP "roto-now-model-tests"
-New-Item -ItemType Directory -Force -Path $testOutput | Out-Null
-
-cargo run --manifest-path src-tauri\Cargo.toml --example parity -- `
-  general ".models\rembg\birefnet-general.onnx" `
-  "C:\path\to\general-photo.png" (Join-Path $testOutput "general-maximum.png")
-
-cargo run --manifest-path src-tauri\Cargo.toml --example parity -- `
-  anime ".models\toonout\birefnet-toonout-fp16.onnx" `
-  "C:\path\to\anime-image.png" (Join-Path $testOutput "anime.png")
-```
-
-Each command should finish with `provider=CPUExecutionProvider` and create a transparent PNG in `%TEMP%\roto-now-model-tests`. These direct smoke tests intentionally use CPU for deterministic parity; the desktop app still prefers DirectML and falls back to CPU automatically.
-
-### Security and temporary files
-
-The desktop capability grants only the open and save dialogs. The asset protocol is statically limited to Roto Now's managed temporary output directory; choosing a file through a native dialog dynamically grants only that selected path. Native commands reject input and destination paths that were not selected through those dialogs. Managed results are deleted when discarded or on a normal app shutdown, and abandoned results older than 24 hours are removed at the next launch.
-
-### Windows installer and signing
-
-Build the NSIS installer with:
-
-```powershell
+& ".\.python-env\Scripts\python.exe" -m pip install -r scripts\requirements-model-conversion.txt
 .\scripts\fetch-ffmpeg.ps1
 .\scripts\fetch-general-lite.ps1
 npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis
 ```
 
-Before packaging, validate synchronized versions, the production CSP, installer policy, and pinned bundle hashes:
+Large model weights, FFmpeg executables, virtual environments, local toolchains, and generated build output are intentionally excluded from Git.
+
+### Local installer with every model
+
+If the ignored `.models` directory contains General Maximum and Anime, build a local NSIS installer that includes every model:
 
 ```powershell
-./scripts/verify-release.ps1 -RequireBundleAssets
+npm.cmd run tauri:build:all-models
 ```
 
-Every push to `main` builds and publishes the Windows release named from `package.json`. Release tags are immutable: if the version tag already belongs to another commit, automation stops and requires a version increment. GitHub displays the installer's calculated SHA-256 digest directly in the release assets list.
-
-For Authenticode signing, configure both repository secrets:
-
-- `WINDOWS_SIGNING_CERTIFICATE`: base64-encoded PFX certificate
-- `WINDOWS_SIGNING_PASSWORD`: PFX password
-
-The certificate is written only to the temporary GitHub runner, used by Tauri's custom signing command for the application executable and installer, verified with SignTool, and removed even when a later step fails. Builds without both secrets remain explicitly unsigned.
-
-The release job silently installs the generated NSIS package into an isolated runner directory twice (initial install and repair), checks the bundled FFmpeg/model files, runs the uninstaller, and verifies that the executable is removed. Before a beta release, also perform a manual clean-install and upgrade test on a standard Windows account, launch the app once, process an image and an audio-bearing video, then uninstall and confirm user-selected exports remain untouched. Per-user downloaded models intentionally remain in app data unless the user removes them from the model manager.
+This verifies and packages General Lite FP32/FP16, General Maximum, and Anime. On first launch, Roto Now copies the bundled models into its per-user app-data folder, so the model manager shows them as ready without downloading anything. The all-model installer is much larger than the normal release installer and is intended for local or offline use.

@@ -23,6 +23,8 @@ Roto Now uses ONNX Runtime through pinned `ort` 2.0.0-rc.12. See https://github.
 
 - Bundled file: `birefnet-general-lite.onnx`
 - SHA-256: `5600024376F572A557870A5EB0AFB1E5961636BEF4E1E22132025467D0F03333`
+- Bundled mixed-precision file: `birefnet-general-lite-fp16.onnx`
+- Mixed-precision SHA-256: `311CFD8088EE71224BA0687B00DFAD1ED28FC05AAE0CE64E87965CC3D4B29D6A`
 - Distribution source: https://github.com/danielgatis/rembg/releases
 - Upstream project: https://github.com/ZhengPeng7/BiRefNet
 

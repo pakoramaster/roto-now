@@ -1,5 +1,6 @@
 param(
-    [switch]$RequireBundleAssets
+    [switch]$RequireBundleAssets,
+    [switch]$RequireAllModels
 )
 
 $ErrorActionPreference = "Stop"
@@ -52,6 +53,7 @@ if ($RequireBundleAssets) {
         "src-tauri\bin\ffmpeg.exe" = "FA142EBDE7643DF62FBF6B45161AD15111CA89A36B41373F058F73476E14F6D0"
         "src-tauri\bin\ffprobe.exe" = "E7F564AE34449A95912EF92D13CEAB91820C93706EE23EA04BCC50F527D289B1"
         "src-tauri\models\birefnet-general-lite.onnx" = "5600024376F572A557870A5EB0AFB1E5961636BEF4E1E22132025467D0F03333"
+        "src-tauri\models\birefnet-general-lite-fp16.onnx" = "311CFD8088EE71224BA0687B00DFAD1ED28FC05AAE0CE64E87965CC3D4B29D6A"
     }
     foreach ($entry in $assets.GetEnumerator()) {
         $path = Join-Path $projectRoot $entry.Key
@@ -60,6 +62,22 @@ if ($RequireBundleAssets) {
         }
         if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $entry.Value) {
             throw "Required bundle asset failed checksum verification: $($entry.Key)"
+        }
+    }
+}
+
+if ($RequireAllModels) {
+    $models = @{
+        "src-tauri\models\birefnet-general.onnx" = "58F621F00F5D756097615970A88A791584600DCF7C45B18A0A6267535A1EBD3C"
+        "src-tauri\models\birefnet-toonout-fp16.onnx" = "213A8A98EE426EF8F02D247EB5A5A9889359E37C2E1E7E31E282D61034D08A83"
+    }
+    foreach ($entry in $models.GetEnumerator()) {
+        $path = Join-Path $projectRoot $entry.Key
+        if (!(Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "Required all-model bundle asset is missing: $($entry.Key)"
+        }
+        if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $entry.Value) {
+            throw "Required all-model bundle asset failed checksum verification: $($entry.Key)"
         }
     }
 }

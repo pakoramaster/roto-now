@@ -9,14 +9,26 @@ $partialPath = "$modelPath.part"
 
 New-Item -ItemType Directory -Force -Path $modelRoot | Out-Null
 if ((Test-Path -LiteralPath $modelPath) -and (Get-FileHash -LiteralPath $modelPath -Algorithm SHA256).Hash -eq $modelSha256) {
-    Write-Host "Pinned General Lite model is already ready."
-    exit 0
+    Write-Host "Pinned General Lite FP32 model is already ready."
+} else {
+    Invoke-WebRequest -Uri $modelUrl -OutFile $partialPath -UseBasicParsing
+    if ((Get-FileHash -LiteralPath $partialPath -Algorithm SHA256).Hash -ne $modelSha256) {
+        Remove-Item -LiteralPath $partialPath -Force
+        throw "General Lite model checksum verification failed."
+    }
+    Move-Item -LiteralPath $partialPath -Destination $modelPath -Force
 }
 
-Invoke-WebRequest -Uri $modelUrl -OutFile $partialPath -UseBasicParsing
-if ((Get-FileHash -LiteralPath $partialPath -Algorithm SHA256).Hash -ne $modelSha256) {
-    Remove-Item -LiteralPath $partialPath -Force
-    throw "General Lite model checksum verification failed."
+$fp16Path = Join-Path $modelRoot "birefnet-general-lite-fp16.onnx"
+$fp16Sha256 = "311CFD8088EE71224BA0687B00DFAD1ED28FC05AAE0CE64E87965CC3D4B29D6A"
+if (!(Test-Path -LiteralPath $fp16Path) -or (Get-FileHash -LiteralPath $fp16Path -Algorithm SHA256).Hash -ne $fp16Sha256) {
+    $python = Join-Path $projectRoot ".python-env\Scripts\python.exe"
+    if (!(Test-Path -LiteralPath $python)) {
+        throw "The project Python environment is required to create the FP16 bundle model."
+    }
+    & $python (Join-Path $PSScriptRoot "convert-general-lite-fp16.py")
+    if ($LASTEXITCODE -ne 0 -or (Get-FileHash -LiteralPath $fp16Path -Algorithm SHA256).Hash -ne $fp16Sha256) {
+        throw "FP16 General Lite conversion failed checksum verification."
+    }
 }
-Move-Item -LiteralPath $partialPath -Destination $modelPath -Force
-Write-Host "Pinned General Lite model is ready for packaging."
+Write-Host "Pinned FP32 and FP16 General Lite models are ready for packaging."

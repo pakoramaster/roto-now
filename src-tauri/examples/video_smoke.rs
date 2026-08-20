@@ -19,6 +19,11 @@ fn main() -> Result<(), String> {
         progress_high_water: Arc::new(AtomicU64::new(0)),
     };
     let preview = args[6] == "preview";
+    let model_id = match std::env::var("ROTO_NOW_MODEL").as_deref() {
+        Ok("anime") => ModelId::Anime,
+        Ok("general") => ModelId::General,
+        _ => ModelId::GeneralLite,
+    };
     let quality = match args[6].as_str() {
         "fast" => "Fast",
         "maximum" => "Maximum",
@@ -35,7 +40,7 @@ fn main() -> Result<(), String> {
         &control,
         PathBuf::from(&args[4]).as_path(),
         PathBuf::from(&args[5]).as_path(),
-        ModelId::GeneralLite,
+        model_id,
         PathBuf::from(&args[1]).as_path(),
         PathBuf::from(&args[2]).as_path(),
         PathBuf::from(&args[3]).as_path(),
@@ -61,14 +66,17 @@ fn main() -> Result<(), String> {
     }
     let result = result?;
     println!(
-        "frames={} size={}x{} fps={:.3} duration={:.3} audio={} provider={}",
+        "frames={} size={}x{} fps={:.3} duration={:.3} audio={} provider={} precision={} inference_ms={:.1} preprocess_ms={:.1}",
         result.frame_count,
         result.width,
         result.height,
         result.frame_rate,
         result.duration,
         result.has_audio,
-        result.provider
+        result.provider,
+        result.precision,
+        result.performance.inference_ms,
+        result.performance.preprocess_ms,
     );
     Ok(())
 }
