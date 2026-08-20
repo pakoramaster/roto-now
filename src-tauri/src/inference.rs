@@ -3,7 +3,7 @@ use crate::{
     models::{model_path, ModelId},
     routing::QualityMode,
 };
-use image::{imageops::FilterType, DynamicImage, GenericImageView, GrayImage};
+use image::{imageops::FilterType, DynamicImage, GrayImage};
 #[cfg(test)]
 use image::{ImageBuffer, Luma};
 use ort::{
@@ -20,7 +20,7 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::AppHandle;
 
@@ -28,14 +28,96 @@ const INPUT_SIZE: u32 = 1024;
 const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const STD: [f32; 3] = [0.229, 0.224, 0.225];
 
+fn model_precision(path: &Path) -> &'static str {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if name.contains("fp16") {
+        "FP16"
+    } else {
+        "FP32"
+    }
+}
+
 pub struct Masker {
     session: Option<Session>,
     model_id: ModelId,
     provider: &'static str,
+    precision: &'static str,
     model_path: PathBuf,
+    fallback_model_path: PathBuf,
     input_scratch: Vec<f32>,
     mask_scratch: Vec<u8>,
     rgba_scratch: Vec<u8>,
+    last_timing: InferenceTiming,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InferenceTiming {
+    pub preprocess: Duration,
+    pub inference: Duration,
+    pub postprocess: Duration,
+}
+
+pub struct PreparedFrame {
+    source_rgb: image::RgbImage,
+    input: Vec<f32>,
+    resize_filter: FilterType,
+    preprocess: Duration,
+}
+
+impl PreparedFrame {
+    pub fn source_bytes(&self) -> &[u8] {
+        self.source_rgb.as_raw()
+    }
+
+    pub fn into_recycling_parts(self) -> (Vec<u8>, Vec<f32>) {
+        (self.source_rgb.into_raw(), self.input)
+    }
+}
+
+pub fn prepare_video_frame(
+    source_rgb: image::RgbImage,
+    model_id: ModelId,
+    quality: &str,
+    input: Vec<f32>,
+) -> Result<PreparedFrame, String> {
+    prepare_rgb_frame(source_rgb, model_id, quality, input)
+}
+
+fn prepare_rgb_frame(
+    source_rgb: image::RgbImage,
+    model_id: ModelId,
+    quality: &str,
+    mut input: Vec<f32>,
+) -> Result<PreparedFrame, String> {
+    let started = Instant::now();
+    let resize_filter = match QualityMode::parse(quality)? {
+        QualityMode::Fast => FilterType::Triangle,
+        QualityMode::Balanced => FilterType::CatmullRom,
+        QualityMode::Maximum => FilterType::Lanczos3,
+    };
+    let rgb = image::imageops::resize(&source_rgb, INPUT_SIZE, INPUT_SIZE, resize_filter);
+    let divisor = if model_id == ModelId::Anime {
+        255.0
+    } else {
+        rgb.as_raw().iter().copied().max().unwrap_or(1).max(1) as f32
+    };
+    let plane = (INPUT_SIZE * INPUT_SIZE) as usize;
+    input.resize(plane * 3, 0.0);
+    for (index, pixel) in rgb.pixels().enumerate() {
+        for channel in 0..3 {
+            input[channel * plane + index] =
+                (pixel[channel] as f32 / divisor - MEAN[channel]) / STD[channel];
+        }
+    }
+    Ok(PreparedFrame {
+        source_rgb,
+        input,
+        resize_filter,
+        preprocess: started.elapsed(),
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,19 +125,24 @@ struct ModelFingerprint {
     path: PathBuf,
     length: u64,
     modified: Option<std::time::SystemTime>,
+    accelerated: Option<(u64, Option<std::time::SystemTime>)>,
 }
 
 impl ModelFingerprint {
-    fn read(path: PathBuf) -> Result<Self, String> {
+    fn read(path: PathBuf, model_id: ModelId) -> Result<Self, String> {
         let metadata = fs::metadata(&path)
             .map_err(|error| format!("Could not inspect model {}: {error}", path.display()))?;
         if !metadata.is_file() {
             return Err(format!("Model path is not a file: {}", path.display()));
         }
+        let accelerated = crate::models::accelerated_model_path(&path, model_id)
+            .and_then(|path| fs::metadata(path).ok())
+            .map(|metadata| (metadata.len(), metadata.modified().ok()));
         Ok(Self {
             path,
             length: metadata.len(),
             modified: metadata.modified().ok(),
+            accelerated,
         })
     }
 }
@@ -83,7 +170,7 @@ impl ModelSessionCache {
         on_load: impl FnOnce(),
         operation: impl FnOnce(&mut Masker, bool) -> Result<R, String>,
     ) -> Result<R, String> {
-        let fingerprint = ModelFingerprint::read(path.clone())?;
+        let fingerprint = ModelFingerprint::read(path.clone(), model_id)?;
         let mut active = self.active.lock();
         let reused = active.as_ref().is_some_and(|entry| {
             entry.masker.model_id == model_id && entry.fingerprint == fingerprint
@@ -137,7 +224,12 @@ impl Masker {
             ));
         }
 
+        let accelerated_path = (std::env::var_os("ROTO_NOW_DISABLE_FP16").as_deref()
+            != Some(std::ffi::OsStr::new("1")))
+        .then(|| crate::models::accelerated_model_path(&path, model_id))
+        .flatten();
         if prefer_directml {
+            let dml_path = accelerated_path.as_ref().unwrap_or(&path);
             let directml = (|| {
                 let builder = Session::builder().map_err(|error| error.to_string())?;
                 let builder = builder
@@ -147,10 +239,14 @@ impl Masker {
                     .with_memory_pattern(false)
                     .map_err(|error| error.to_string())?;
                 let mut builder = builder
-                    .with_execution_providers([ep::DirectML::default().build()])
+                    .with_execution_providers([ep::DirectML::default()
+                        .with_performance_preference(
+                            ep::directml::PerformancePreference::HighPerformance,
+                        )
+                        .build()])
                     .map_err(|error| error.to_string())?;
                 builder
-                    .commit_from_file(&path)
+                    .commit_from_file(dml_path)
                     .map_err(|error| error.to_string())
             })();
             if let Ok(session) = directml {
@@ -158,10 +254,13 @@ impl Masker {
                     session: Some(session),
                     model_id,
                     provider: "DmlExecutionProvider",
-                    model_path: path,
+                    precision: model_precision(dml_path),
+                    model_path: dml_path.clone(),
+                    fallback_model_path: path,
                     input_scratch: Vec::new(),
                     mask_scratch: Vec::new(),
                     rgba_scratch: Vec::new(),
+                    last_timing: InferenceTiming::default(),
                 });
             }
         }
@@ -188,15 +287,30 @@ impl Masker {
             session: Some(session),
             model_id,
             provider: "CPUExecutionProvider",
-            model_path: path,
+            precision: model_precision(&path),
+            model_path: path.clone(),
+            fallback_model_path: path,
             input_scratch: Vec::new(),
             mask_scratch: Vec::new(),
             rgba_scratch: Vec::new(),
+            last_timing: InferenceTiming::default(),
         })
     }
 
     pub fn provider(&self) -> &'static str {
         self.provider
+    }
+
+    pub fn precision(&self) -> &'static str {
+        self.precision
+    }
+
+    pub fn model_id(&self) -> ModelId {
+        self.model_id
+    }
+
+    pub fn last_timing(&self) -> InferenceTiming {
+        self.last_timing
     }
 
     pub fn recycle_cutout(&mut self, cutout: DynamicImage) {
@@ -212,43 +326,37 @@ impl Masker {
         quality: &str,
         control: &JobControl,
     ) -> Result<DynamicImage, String> {
-        let (width, height) = source.dimensions();
-        let converted;
-        let source_rgb = if let Some(rgb) = source.as_rgb8() {
-            rgb
-        } else {
-            converted = source.to_rgb8();
-            &converted
-        };
-        let quality = QualityMode::parse(quality)?;
-        let resize_filter = if quality == QualityMode::Fast {
-            FilterType::Triangle
-        } else {
-            FilterType::Lanczos3
-        };
-        let rgb = image::imageops::resize(source_rgb, INPUT_SIZE, INPUT_SIZE, resize_filter);
-        let divisor = if self.model_id == ModelId::Anime {
-            255.0
-        } else {
-            rgb.as_raw().iter().copied().max().unwrap_or(1).max(1) as f32
-        };
+        let mut prepared = prepare_rgb_frame(
+            source.to_rgb8(),
+            self.model_id,
+            quality,
+            std::mem::take(&mut self.input_scratch),
+        )?;
+        let result = self.apply_prepared(&prepared, edge_detail, control);
+        self.input_scratch = std::mem::take(&mut prepared.input);
+        result
+    }
+
+    pub fn apply_prepared(
+        &mut self,
+        prepared: &PreparedFrame,
+        edge_detail: u8,
+        control: &JobControl,
+    ) -> Result<DynamicImage, String> {
+        let (width, height) = prepared.source_rgb.dimensions();
+        let source_rgb = &prepared.source_rgb;
+        let resize_filter = prepared.resize_filter;
         let plane = (INPUT_SIZE * INPUT_SIZE) as usize;
-        self.input_scratch.resize(plane * 3, 0.0);
-        for (index, pixel) in rgb.pixels().enumerate() {
-            for channel in 0..3 {
-                self.input_scratch[channel * plane + index] =
-                    (pixel[channel] as f32 / divisor - MEAN[channel]) / STD[channel];
-            }
-        }
 
         if control.cancelled.load(Ordering::SeqCst) {
             return Err("cancelled".into());
         }
+        let inference_started = Instant::now();
         let mut mask = match run_session(
             self.session
                 .as_mut()
                 .ok_or("The inference session is unavailable")?,
-            &self.input_scratch,
+            &prepared.input,
             control,
         ) {
             Ok(mask) => mask,
@@ -267,12 +375,16 @@ impl Masker {
                         .with_memory_pattern(false)
                         .map_err(|error| error.to_string())?;
                     let mut builder = builder
-                        .with_execution_providers([ep::DirectML::default().build()])
+                        .with_execution_providers([ep::DirectML::default()
+                            .with_performance_preference(
+                                ep::directml::PerformancePreference::HighPerformance,
+                            )
+                            .build()])
                         .map_err(|error| error.to_string())?;
                     let mut session = builder
                         .commit_from_file(&self.model_path)
                         .map_err(|error| error.to_string())?;
-                    let mask = run_session(&mut session, &self.input_scratch, control)?;
+                    let mask = run_session(&mut session, &prepared.input, control)?;
                     Ok((session, mask))
                 })();
                 if let Ok((session, mask)) = directml_retry {
@@ -292,25 +404,31 @@ impl Masker {
                     let mut builder = builder
                         .with_memory_pattern(false)
                         .map_err(|error| error.to_string())?;
-                    self.session = Some(builder.commit_from_file(&self.model_path).map_err(
-                        |cpu_error| {
-                            format!(
+                    self.session = Some(
+                        builder
+                            .commit_from_file(&self.fallback_model_path)
+                            .map_err(|cpu_error| {
+                                format!(
                                 "DirectML failed ({error}); CPU fallback also failed: {cpu_error}"
                             )
-                        },
-                    )?);
+                            })?,
+                    );
                     self.provider = "CPUExecutionProvider";
+                    self.precision = model_precision(&self.fallback_model_path);
+                    self.model_path.clone_from(&self.fallback_model_path);
                     run_session(
                         self.session
                             .as_mut()
                             .ok_or("The inference session is unavailable")?,
-                        &self.input_scratch,
+                        &prepared.input,
                         control,
                     )?
                 }
             }
             Err(error) => return Err(error),
         };
+        let inference = inference_started.elapsed();
+        let postprocess_started = Instant::now();
 
         if mask.len() < plane {
             return Err("Model returned an undersized mask".into());
@@ -359,6 +477,11 @@ impl Masker {
         let rgba =
             image::RgbaImage::from_raw(width, height, std::mem::take(&mut self.rgba_scratch))
                 .ok_or("Could not construct RGBA cutout")?;
+        self.last_timing = InferenceTiming {
+            preprocess: prepared.preprocess,
+            inference,
+            postprocess: postprocess_started.elapsed(),
+        };
         Ok(DynamicImage::ImageRgba8(rgba))
     }
 }
@@ -480,9 +603,9 @@ mod tests {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("roto-now-model-cache-{suffix}.onnx"));
         fs::write(&path, b"first").unwrap();
-        let first = ModelFingerprint::read(path.clone()).unwrap();
+        let first = ModelFingerprint::read(path.clone(), ModelId::GeneralLite).unwrap();
         fs::write(&path, b"replacement").unwrap();
-        let replacement = ModelFingerprint::read(path.clone()).unwrap();
+        let replacement = ModelFingerprint::read(path.clone(), ModelId::GeneralLite).unwrap();
         let _ = fs::remove_file(path);
 
         assert_ne!(first, replacement);

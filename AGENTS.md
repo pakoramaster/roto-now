@@ -8,10 +8,9 @@ Roto Now is a Windows-first Tauri desktop application for fully local background
 
 - `src/`: React and TypeScript interface. Keep native calls behind Tauri commands and retain the browser-only fallback where practical.
 - `src-tauri/`: Native Rust jobs, model downloads, ONNX Runtime inference, FFmpeg video processing, managed outputs, saving, and cleanup.
-- `backend/worker.py` and `backend/video_worker.py`: Non-shipped Python parity references only.
 - `src-tauri/bin/`: Locally fetched FFmpeg binaries. Never commit the executables; reproduce them with `scripts/fetch-ffmpeg.ps1`.
 - General Lite is fetched into `src-tauri/models/` for installer builds, then seeded into Tauri's per-user app-data folder on first run. Other models are downloaded there on demand. Never commit model weights.
-- `.python-env/` and `.toolchains/`: Test-reference and project-local runtimes. Never commit or hand-edit generated package contents.
+- `.python-env/` and `.toolchains/`: Model-conversion and project-local runtimes. Never commit or hand-edit generated package contents.
 
 ## Development commands
 
@@ -44,6 +43,6 @@ For a Rust-only check, use the project-local toolchain configured by `scripts/ta
 Before handing off a UI or command change:
 
 1. Run `npm.cmd run build`.
-2. Run `python -m py_compile backend/worker.py backend/video_worker.py` using `.python-env` after Python changes.
+2. Run `python -m py_compile scripts/convert-general-lite-fp16.py` using `.python-env` after changing the model conversion utility.
 3. Run `cargo check` after Rust, capability, or Tauri configuration changes.
 4. For processing changes, test a real general image, an anime image when relevant, and a short video with audio when relevant.

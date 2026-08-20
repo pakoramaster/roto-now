@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -14,7 +14,8 @@ type CorrectionMode = "restore" | "erase";
 
 interface ImportedMedia { file?: File; path?: string; name: string; size: number; kind: MediaKind; url: string; }
 interface NativeMediaInfo { path: string; name: string; size: number; kind: MediaKind; previewDataUrl?: string; }
-interface ProcessResult { outputPath: string; model: string; provider: string; durationMs: number; frameCount?: number; width?: number; height?: number; frameRate?: number; mediaDurationSeconds?: number; hasAudio?: boolean; preview: boolean; }
+interface PerformanceMetrics { decodeMs: number; preprocessMs: number; inferenceMs: number; postprocessMs: number; temporalAndCompositeMs: number; encodeMs: number; firstInferenceMs?: number; }
+interface ProcessResult { outputPath: string; model: string; provider: string; precision: string; pipeline: string; performance?: PerformanceMetrics; durationMs: number; frameCount?: number; width?: number; height?: number; frameRate?: number; mediaDurationSeconds?: number; hasAudio?: boolean; preview: boolean; }
 interface ModelStatus { id: ModelId; name: string; size: number; installed: boolean; managed: boolean; state: string; provider: string; }
 interface BootstrapStatus { ready: boolean; provider: string; models: ModelStatus[]; }
 interface EngineStatus { application: string; version: string; inferenceEngine: string; ffmpeg: string; }
@@ -40,6 +41,7 @@ const formatTime = (seconds: number) => {
 function App() {
   const inputRef = useRef<HTMLInputElement>(null);
   const playheadRef = useRef(0);
+  const requestedPreviewTimeRef = useRef(0);
   const [playhead, setPlayhead] = useState(0);
   const [media, setMedia] = useState<ImportedMedia | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -65,6 +67,14 @@ function App() {
   const [helpOpen, setHelpOpen] = useState(false);
   const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null);
 
+  const updatePlaybackRef = useCallback((seconds: number) => {
+    playheadRef.current = seconds;
+  }, []);
+  const updateSharedPlayhead = useCallback((seconds: number) => {
+    playheadRef.current = seconds;
+    setPlayhead(seconds);
+  }, []);
+
   const refreshBootstrap = async () => {
     if (!isTauriRuntime()) { setBootstrap({ ready: true, provider: "Browser mock", models: [] }); return; }
     setBootstrap(await invoke<BootstrapStatus>("get_bootstrap_status"));
@@ -84,7 +94,11 @@ function App() {
       if (payload.type === "failed") { setStatus((current) => current === "idle" ? "idle" : "ready"); setError(payload.error); return; }
       if (payload.type === "cancelled") { setStatus((current) => current === "idle" ? "idle" : "ready"); return; }
       if (!payload.result.outputPath) { void refreshBootstrap(); return; }
-      if (payload.result.preview) setPreviewResult(payload.result); else { setFullResult(payload.result); setCorrectionOpen(false); setCorrectionStrokes([]); }
+      if (payload.result.preview) {
+        setPreviewResult(payload.result);
+        playheadRef.current = requestedPreviewTimeRef.current;
+        setPlayhead(requestedPreviewTimeRef.current);
+      } else { setFullResult(payload.result); setCorrectionOpen(false); setCorrectionStrokes([]); }
       setPreviewMode("output");
       setStatus("done");
     }).then((cleanup) => { unlisten = cleanup; });
@@ -157,7 +171,7 @@ function App() {
     if (!isTauriRuntime() || !media.path) { setStatus("processing"); window.setTimeout(() => setStatus("done"), 900); return; }
     try {
       setError(null); setSavedPath(null); setProgress({ phase: "starting", message: fastPreview ? "Preparing preview frame" : "Preparing job" }); setStatus("processing");
-      if (fastPreview) { discard(previewResult); setPreviewResult(null); }
+      if (fastPreview) { requestedPreviewTimeRef.current = playheadRef.current; discard(previewResult); setPreviewResult(null); }
       else { clearResults(); }
       const command = media.kind === "image" ? "start_image_job" : "start_video_job";
       const id = await invoke<string>(command, {
@@ -211,17 +225,17 @@ function App() {
       <section className="intro-row"><h1>Cut out the subject.<br /><span>Keep every detail.</span></h1></section>
       {media?.kind === "image" && correctionOpen && fullResult ? <section className="editor-grid correction-grid"><div className="preview-panel panel"><div className="panel-heading"><div><span className="media-badge"><Brush size={14} /></span><h2>Manual correction</h2><p>{media.name} · draw directly on the mask</p></div><button className="icon-button" aria-label="Close correction editor" onClick={() => { setCorrectionOpen(false); setCorrectionStrokes([]); }}><X size={18} /></button></div><div className="media-stage correction-stage checkerboard"><CorrectionCanvas inputSource={media.url} outputSource={convertFileSrc(fullResult.outputPath)} mode={correctionMode} radius={brushRadius} strokes={correctionStrokes} onChange={setCorrectionStrokes} /></div></div><aside className="controls-panel panel correction-controls"><div className="controls-title"><div><p>MASK EDITOR</p><h2>Refine the cutout</h2></div><Brush size={19} /></div><label className="control-group"><span>Brush mode</span><div className="segmented correction-modes"><button className={correctionMode === "restore" ? "active" : ""} onClick={() => setCorrectionMode("restore")}><Brush size={14} /> Restore</button><button className={correctionMode === "erase" ? "active" : ""} onClick={() => setCorrectionMode("erase")}><Eraser size={14} /> Erase</button></div><small>Restore brings original pixels back. Erase makes unwanted areas transparent.</small></label><label className="control-group range-group"><span><b>Brush size</b><output>{Math.round(brushRadius * 200)}%</output></span><input type="range" min="0.005" max="0.08" step="0.005" value={brushRadius} onChange={(event) => setBrushRadius(Number(event.target.value))} /></label><div className="correction-summary"><strong>{correctionStrokes.length}</strong><span>{correctionStrokes.length === 1 ? "brush stroke" : "brush strokes"}</span></div><button className="process-button" disabled={correctionStrokes.length === 0 || applyingCorrections} onClick={applyCorrections}>{applyingCorrections ? <><span className="mini-spinner" /> Applying…</> : <><Check size={18} /> Apply corrections</>}</button><button className="reset-button" disabled={correctionStrokes.length === 0} onClick={() => setCorrectionStrokes((current) => current.slice(0, -1))}><Undo2 size={14} /> Undo last stroke</button><button className="reset-button" disabled={correctionStrokes.length === 0} onClick={() => setCorrectionStrokes([])}><RotateCcw size={14} /> Clear brushwork</button><button className="reset-button" onClick={() => { setCorrectionOpen(false); setCorrectionStrokes([]); }}><X size={14} /> Cancel</button></aside></section> : !media ? <section className={`drop-zone ${dragging ? "is-dragging" : ""}`} onDragEnter={(event) => { event.preventDefault(); setDragging(true); }} onDragOver={(event) => event.preventDefault()} onDragLeave={(event) => { event.preventDefault(); setDragging(false); }} onDrop={(event) => { event.preventDefault(); setDragging(false); acceptFile(event.dataTransfer.files[0]); }}><div className="drop-glow" /><span className="upload-icon"><UploadCloud size={30} /></span><h2>Drop an image or video here</h2><p>or choose a file from your computer</p><button className="primary-button" onClick={browseFiles}><FolderOpen size={17} /> Browse files</button><div className="format-row"><span><FileImage size={14} /> PNG, JPG, WEBP</span><i /><span><Film size={14} /> MP4, MOV, WEBM</span></div></section> :
       <section className="editor-grid"><div className="preview-panel panel"><div className="panel-heading"><div><span className="media-badge">{media.kind === "image" ? <ImageIcon size={14} /> : <Film size={14} />}</span><h2>{media.name}</h2><p>{formatBytes(media.size)} · {status === "done" ? "Result ready" : "Ready to process"}</p></div><div className="preview-actions"><div className="preview-toggle" aria-label="Preview source"><button className={previewMode === "input" ? "active" : ""} aria-pressed={previewMode === "input"} onClick={() => setPreviewMode("input")}>Input</button><button className={previewMode === "output" ? "active" : ""} aria-pressed={previewMode === "output"} onClick={() => setPreviewMode("output")} disabled={!displayResult}>Output</button></div><button className="icon-button" aria-label="Close media" onClick={reset}><X size={18} /></button></div></div>
-        <div className={`media-stage ${media.kind === "image" ? "checkerboard" : previewMode === "output" ? `screen-${screenColor}` : ""}`}>{media.kind === "image" || (media.kind === "video" && previewMode === "output" && displayResult?.preview) ? <img src={previewSource} alt={displayResult?.preview ? "Processed video preview frame" : previewMode === "output" ? "Background removed" : "Input"} /> : <VideoPlayer key={previewSource} source={previewSource} onTimeChange={previewMode === "input" ? (seconds) => { playheadRef.current = seconds; setPlayhead(seconds); } : undefined} />}{status === "processing" && <div className="processing-overlay"><span className="spinner" /><strong>{progress?.message ?? "Preparing the cutout"}</strong>{progress && <ProgressView progress={progress} />}{activeJobId && <button className="cancel-overlay" onClick={cancelJob}><Pause size={14} /> Cancel</button>}</div>}{status === "done" && previewMode === "output" && <div className="done-badge"><Check size={15} /> {displayResult?.preview ? "Preview frame" : media.kind === "image" ? "Background removed" : "Full export"}</div>}</div></div>
+        <div className={`media-stage ${media.kind === "image" ? "checkerboard" : previewMode === "output" ? `screen-${screenColor}` : ""}`}>{media.kind === "image" || (media.kind === "video" && previewMode === "output" && displayResult?.preview) ? <img src={previewSource} alt={displayResult?.preview ? "Processed video preview frame" : previewMode === "output" ? "Background removed" : "Input"} /> : <VideoPlayer key={previewSource} source={previewSource} initialTime={playheadRef.current} onPlaybackTime={updatePlaybackRef} onTimeChange={updateSharedPlayhead} />}{status === "processing" && <div className="processing-overlay"><span className="spinner" /><strong>{progress?.message ?? "Preparing the cutout"}</strong>{progress && <ProgressView progress={progress} />}{activeJobId && <button className="cancel-overlay" onClick={cancelJob}><Pause size={14} /> Cancel</button>}</div>}{status === "done" && previewMode === "output" && <div className="done-badge"><Check size={15} /> {displayResult?.preview ? "Preview frame" : media.kind === "image" ? "Background removed" : "Full export"}</div>}</div></div>
         <aside className="controls-panel panel"><div className="controls-title"><div><p>OUTPUT SETTINGS</p><h2>Configure cutout</h2></div><Settings2 size={19} /></div>
-          <div className="control-group"><span>Detection model</span><div className="segmented">{(["General", "Anime"] as Model[]).map((item) => <button key={item} className={model === item ? "active" : ""} aria-pressed={model === item} onClick={() => setModel(item)}>{item}</button>)}</div><small>{model === "Anime" ? "Optimized for line art and stylized edges." : "Handles people, animals, products and objects."}</small></div>
+          <div className="control-group"><span>Detection model</span><div className="segmented">{(["General", "Anime"] as Model[]).map((item) => <button key={item} className={model === item ? "active" : ""} aria-pressed={model === item} onClick={() => { setModel(item); clearResults(); }}>{item}</button>)}</div><small>{model === "Anime" ? "Optimized for line art and stylized edges." : "Handles people, animals, products and objects."}</small></div>
           {media.kind === "video" && <div className="control-group"><span>Screen colour</span><div className="color-options"><button className={screenColor === "green" ? "selected" : ""} aria-pressed={screenColor === "green"} onClick={() => setScreenColor("green")}><i className="green-swatch" /><span>Green</span>{screenColor === "green" && <Check size={14} />}</button><button className={screenColor === "blue" ? "selected" : ""} aria-pressed={screenColor === "blue"} onClick={() => setScreenColor("blue")}><i className="blue-swatch" /><span>Blue</span>{screenColor === "blue" && <Check size={14} />}</button></div><small>Motion-aware stabilization reduces mask flicker. Exports normalize rotation, frame timing, and audio sync.</small></div>}
-          <label className="control-group"><span>Quality</span><div className="quality-select"><Zap size={16} /><select value={quality} onChange={(event) => setQuality(event.target.value as Quality)}><option>Fast</option><option>Balanced</option><option>Maximum</option></select></div><small>{quality === "Fast" ? `General Lite · quicker mask resampling${media.kind === "video" ? " · faster encoding" : ""}.` : quality === "Balanced" ? `General Lite · detailed mask resampling${media.kind === "video" ? " · balanced encoding" : ""}.` : `General Maximum · highest detail${media.kind === "video" ? " · slower high-quality encoding" : ""}.`}</small>{requiredModel() && !requiredModel()?.installed && <small className="download-needed">{requiredModel()?.name} needs to be downloaded. <button onClick={() => setShowModels(true)}>Open models</button></small>}</label>
+          <label className="control-group"><span>Quality</span><div className="quality-select"><Zap size={16} /><select value={quality} onChange={(event) => setQuality(event.target.value as Quality)}><option>Fast</option><option>Balanced</option><option>Maximum</option></select></div><small>{quality === "Fast" ? `General Lite · quickest processing${media.kind === "video" ? " and export" : ""}.` : quality === "Balanced" ? `General Lite · good detail with a faster${media.kind === "video" ? " export" : " result"}.` : `General Maximum · highest detail${media.kind === "video" ? " · slower export" : ""}.`}</small>{requiredModel() && !requiredModel()?.installed && <small className="download-needed">{requiredModel()?.name} needs to be downloaded. <button onClick={() => setShowModels(true)}>Open models</button></small>}</label>
           <label className="control-group range-group"><span><b>Edge detail</b><output>{edgeDetail}%</output></span><input type="range" min="0" max="100" value={edgeDetail} onChange={(event) => setEdgeDetail(Number(event.target.value))} /><small>Preserves fine hair, fur and soft edges.</small></label>
           <div className="export-card"><span>{media.kind === "image" ? <FileImage size={20} /> : <Film size={20} />}</span><div><small>EXPORT FORMAT</small><strong>{media.kind === "image" ? "Transparent PNG" : `${screenColor === "green" ? "Green" : "Blue"} screen MP4`}</strong></div><Check size={16} /></div>
           {media.kind === "video" && <button className="preview-button" onClick={() => runJob(true)} disabled={status === "processing" || !!(requiredModel(true) && !requiredModel(true)?.installed)}><ImageIcon size={17} /> Preview frame at {formatTime(playhead)}</button>}
           {media.kind === "image" && fullResult && <button className="preview-button correction-button" onClick={() => { setCorrectionStrokes([]); setCorrectionOpen(true); }}><Brush size={17} /> Correct mask manually</button>}
           <button className="process-button" onClick={fullResult ? saveResult : () => runJob(false)} disabled={processingDisabled}>{fullResult ? <><Download size={18} />{savedPath ? "Save another copy" : `Save ${media.kind === "image" ? "PNG" : "full MP4"}`}</> : status === "processing" ? <><span className="mini-spinner" /> Processing…</> : <><WandSparkles size={18} /> {media.kind === "video" ? "Process full video" : "Remove background"}<ArrowRight size={17} /></>}</button>
-          {displayResult && <p className="result-note">{displayResult.preview ? "Frame preview" : "Full result"} · {displayResult.model} · processed in {(displayResult.durationMs / 1000).toFixed(1)}s · {displayResult.provider.replace("ExecutionProvider", "")}{displayResult.width && displayResult.height ? ` · ${displayResult.width}×${displayResult.height}` : ""}{!displayResult.preview && displayResult.frameRate ? ` · ${displayResult.frameRate.toFixed(2)} fps` : ""}{!displayResult.preview && displayResult.mediaDurationSeconds != null ? ` · ${displayResult.mediaDurationSeconds.toFixed(2)}s media` : ""}{displayResult.frameCount ? ` · ${displayResult.frameCount} ${displayResult.frameCount === 1 ? "frame" : "frames"}` : ""}{media.kind === "video" && !displayResult.preview && displayResult.hasAudio != null ? displayResult.hasAudio ? " · audio" : " · silent" : ""}</p>}
+          {displayResult && <p className="result-note" title={displayResult.pipeline}>{displayResult.preview ? "Frame preview" : "Full result"} · {displayResult.model} · processed in {(displayResult.durationMs / 1000).toFixed(1)}s · {displayResult.provider.replace("ExecutionProvider", "")} {displayResult.precision}{displayResult.width && displayResult.height ? ` · ${displayResult.width}×${displayResult.height}` : ""}{!displayResult.preview && displayResult.frameRate ? ` · ${displayResult.frameRate.toFixed(2)} fps` : ""}{!displayResult.preview && displayResult.mediaDurationSeconds != null ? ` · ${displayResult.mediaDurationSeconds.toFixed(2)}s media` : ""}{displayResult.frameCount ? ` · ${displayResult.frameCount} ${displayResult.frameCount === 1 ? "frame" : "frames"}` : ""}{media.kind === "video" && !displayResult.preview && displayResult.hasAudio != null ? displayResult.hasAudio ? " · audio" : " · silent" : ""}{displayResult.performance ? ` · inference ${(displayResult.performance.inferenceMs / Math.max(1, displayResult.frameCount ?? 1)).toFixed(0)}ms/frame` : ""}</p>}
           {fullResult && <button className="reset-button" onClick={() => runJob(false)}><WandSparkles size={14} /> Process again</button>}<button className="reset-button" onClick={reset}><RotateCcw size={14} /> Choose another file</button>
         </aside></section>}
       {helpOpen && <div className="modal-backdrop" role="presentation" onPointerDown={(event) => { if (event.target === event.currentTarget) setHelpOpen(false); }}><section className="help-dialog panel" role="dialog" aria-modal="true" aria-labelledby="help-title"><div className="help-heading"><div><p>ROTO NOW BETA</p><h2 id="help-title">Help &amp; about</h2></div><button className="icon-button" aria-label="Close help" autoFocus onClick={() => setHelpOpen(false)}><X size={18} /></button></div><div className="help-grid"><article><strong>1. Choose media</strong><span>Open a supported image or video. Your files stay on this computer.</span></article><article><strong>2. Configure</strong><span>Choose General for photos and objects, or Anime for stylized artwork. Video previews process the frame at the playhead.</span></article><article><strong>3. Process and save</strong><span>Review Input and Output, refine image masks when needed, then choose where to save.</span></article></div><div className="privacy-note"><Check size={16} /><span><strong>Fully local processing</strong>No media is uploaded. Optional model downloads are the only network activity.</span></div><dl className="about-list"><div><dt>Version</dt><dd>{engineStatus ? `${engineStatus.version} beta` : "Development preview"}</dd></div><div><dt>Inference</dt><dd>{engineStatus?.inferenceEngine ?? "Native ONNX Runtime"}</dd></div><div><dt>Video</dt><dd>{engineStatus?.ffmpeg === "bundled" ? "Bundled FFmpeg" : engineStatus?.ffmpeg ?? "Bundled FFmpeg"}</dd></div></dl></section></div>}
@@ -230,7 +244,7 @@ function App() {
   </div>;
 }
 
-function VideoPlayer({ source, onTimeChange }: { source: string; onTimeChange?: (seconds: number) => void; }) {
+function VideoPlayer({ source, initialTime, onPlaybackTime, onTimeChange }: { source: string; initialTime: number; onPlaybackTime: (seconds: number) => void; onTimeChange: (seconds: number) => void; }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const playerRef = useRef<HTMLDivElement>(null);
   const [playing, setPlaying] = useState(false);
@@ -243,12 +257,15 @@ function VideoPlayer({ source, onTimeChange }: { source: string; onTimeChange?: 
     if (!playing) return;
     let animationFrame = 0;
     const updatePlayhead = () => {
-      if (videoRef.current) setCurrentTime(videoRef.current.currentTime);
+      if (videoRef.current) {
+        setCurrentTime(videoRef.current.currentTime);
+        onPlaybackTime(videoRef.current.currentTime);
+      }
       animationFrame = requestAnimationFrame(updatePlayhead);
     };
     animationFrame = requestAnimationFrame(updatePlayhead);
     return () => cancelAnimationFrame(animationFrame);
-  }, [playing]);
+  }, [onPlaybackTime, playing]);
 
   useEffect(() => {
     const updateFullscreen = () => setFullscreen(document.fullscreenElement === playerRef.current);
@@ -270,6 +287,15 @@ function VideoPlayer({ source, onTimeChange }: { source: string; onTimeChange?: 
     onTimeChange?.(seconds);
   };
 
+  const syncInitialTime = (video: HTMLVideoElement) => {
+    const videoDuration = Number.isFinite(video.duration) ? video.duration : 0;
+    const target = Math.min(Math.max(initialTime, 0), videoDuration || initialTime);
+    video.currentTime = target;
+    setCurrentTime(target);
+    onPlaybackTime(target);
+    onTimeChange(target);
+  };
+
   const toggleMute = () => {
     const video = videoRef.current;
     if (!video) return;
@@ -286,7 +312,7 @@ function VideoPlayer({ source, onTimeChange }: { source: string; onTimeChange?: 
   };
 
   return <div className="video-player" ref={playerRef}>
-    <video ref={videoRef} src={source} preload="metadata" onClick={togglePlayback} onLoadedMetadata={(event) => setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0)} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} onTimeUpdate={(event) => { const seconds = event.currentTarget.currentTime; setCurrentTime(seconds); onTimeChange?.(seconds); }} />
+    <video ref={videoRef} src={source} preload="metadata" onClick={togglePlayback} onLoadedMetadata={(event) => { setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0); syncInitialTime(event.currentTarget); }} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} onTimeUpdate={(event) => { const seconds = event.currentTarget.currentTime; setCurrentTime(seconds); onPlaybackTime(seconds); onTimeChange(seconds); }} />
     <div className="video-controls">
       <button type="button" aria-label={playing ? "Pause video" : "Play video"} onClick={togglePlayback}>{playing ? <Pause size={15} /> : <Play size={15} />}</button>
       <span className="video-time">{formatTime(currentTime)}</span>

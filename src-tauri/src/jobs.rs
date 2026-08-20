@@ -21,10 +21,25 @@ pub struct JobState {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PerformanceMetrics {
+    pub decode_ms: f64,
+    pub preprocess_ms: f64,
+    pub inference_ms: f64,
+    pub postprocess_ms: f64,
+    pub temporal_and_composite_ms: f64,
+    pub encode_ms: f64,
+    pub first_inference_ms: Option<f64>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProcessResult {
     pub output_path: String,
     pub model: String,
     pub provider: String,
+    pub precision: String,
+    pub pipeline: String,
+    pub performance: Option<PerformanceMetrics>,
     pub duration_ms: u64,
     pub frame_count: Option<u64>,
     pub width: Option<u32>,

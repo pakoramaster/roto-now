@@ -1,6 +1,6 @@
 use crate::{
-    inference::{composite_screen, composite_screen_into, Masker},
-    jobs::{emit_progress, JobControl},
+    inference::{composite_screen, prepare_video_frame, Masker, PreparedFrame},
+    jobs::{emit_progress, JobControl, PerformanceMetrics},
     models::ModelId,
     routing::QualityMode,
     temporal::TemporalMaskStabilizer,
@@ -8,11 +8,13 @@ use crate::{
 use image::{DynamicImage, ImageBuffer, Rgb};
 use serde::Deserialize;
 use std::{
+    collections::VecDeque,
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::atomic::Ordering,
-    time::Instant,
+    sync::{atomic::Ordering, mpsc},
+    thread,
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Manager};
 
@@ -280,7 +282,7 @@ fn normalized_dimensions(width: u32, height: u32, sample_aspect: f64, rotation: 
 fn encoding_profile(quality: QualityMode) -> (&'static str, &'static str) {
     match quality {
         QualityMode::Fast => ("23", "veryfast"),
-        QualityMode::Balanced => ("18", "medium"),
+        QualityMode::Balanced => ("19", "fast"),
         QualityMode::Maximum => ("16", "slow"),
     }
 }
@@ -499,6 +501,9 @@ fn validate_export(
 pub struct VideoOutcome {
     pub frame_count: u64,
     pub provider: String,
+    pub precision: String,
+    pub pipeline: String,
+    pub performance: PerformanceMetrics,
     pub width: u32,
     pub height: u32,
     pub frame_rate: f64,
@@ -648,6 +653,7 @@ fn process_preview_frame(
             "Processing preview frame",
         );
     }
+    let decode_started = Instant::now();
     let decoded = background_command(ffmpeg)
         .args(["-hide_banner", "-loglevel", "error", "-ss"])
         .arg(format!("{start:.6}"))
@@ -667,6 +673,7 @@ fn process_preview_frame(
         ])
         .output()
         .map_err(|error| format!("Could not decode the preview frame: {error}"))?;
+    let decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
     if !decoded.status.success() {
         let details = String::from_utf8_lossy(&decoded.stderr).trim().to_string();
         return Err(if details.is_empty() {
@@ -683,6 +690,8 @@ fn process_preview_frame(
         quality,
         control,
     )?;
+    let timing = masker.last_timing();
+    let composite_started = Instant::now();
     let composited_bytes = composite_screen(&cutout, screen_color);
     masker.recycle_cutout(cutout);
     let composited = ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, composited_bytes)
@@ -690,6 +699,7 @@ fn process_preview_frame(
     composited
         .save_with_format(output, image::ImageFormat::Png)
         .map_err(|error| format!("Could not save the preview frame: {error}"))?;
+    let temporal_and_composite_ms = composite_started.elapsed().as_secs_f64() * 1000.0;
     if let Some(app) = app {
         emit_progress(
             app,
@@ -704,6 +714,17 @@ fn process_preview_frame(
     Ok(VideoOutcome {
         frame_count: PREVIEW_FRAME_COUNT,
         provider: masker.provider().into(),
+        precision: masker.precision().into(),
+        pipeline: "BiRefNet temporal preview".into(),
+        performance: PerformanceMetrics {
+            decode_ms,
+            preprocess_ms: timing.preprocess.as_secs_f64() * 1000.0,
+            inference_ms: timing.inference.as_secs_f64() * 1000.0,
+            postprocess_ms: timing.postprocess.as_secs_f64() * 1000.0,
+            temporal_and_composite_ms,
+            encode_ms: 0.0,
+            first_inference_ms: Some(timing.inference.as_secs_f64() * 1000.0),
+        },
         width,
         height,
         frame_rate: fps,
@@ -769,8 +790,9 @@ fn process_video_with_masker(
             Some(total),
             None,
             format!(
-                "Preparing {} inference and {} encoding",
+                "Preparing {} {} inference and {} encoding",
                 masker.provider().trim_end_matches("ExecutionProvider"),
+                masker.precision(),
                 video_encoder.label()
             ),
         );
@@ -867,7 +889,7 @@ fn process_video_with_masker(
             format!("Could not start video encoder: {error}")
         })?;
 
-    let mut reader = match decoder.stdout.take() {
+    let reader = match decoder.stdout.take() {
         Some(reader) => reader,
         None => {
             kill(&mut decoder);
@@ -886,49 +908,116 @@ fn process_video_with_masker(
         }
     };
     let frame_size = width as usize * height as usize * 3;
-    let mut bytes = vec![0_u8; frame_size];
+    let (prepared_tx, prepared_rx) =
+        mpsc::sync_channel::<Result<(PreparedFrame, Duration), String>>(2);
+    let (recycle_tx, recycle_rx) = mpsc::sync_channel::<(Vec<u8>, Vec<f32>)>(2);
+    let quality_for_pipeline = quality.to_string();
+    let pipeline_model_id = masker.model_id();
+    let cancelled = control.cancelled.clone();
+    let pipeline = thread::spawn(move || {
+        let mut reader = reader;
+        let mut buffers = VecDeque::from([
+            (vec![0_u8; frame_size], Vec::new()),
+            (vec![0_u8; frame_size], Vec::new()),
+        ]);
+        for _ in 0..total {
+            if cancelled.load(Ordering::SeqCst) {
+                break;
+            }
+            let (mut bytes, input) = match buffers.pop_front() {
+                Some(buffers) => buffers,
+                None => match recycle_rx.recv() {
+                    Ok(buffers) => buffers,
+                    Err(_) => break,
+                },
+            };
+            let decode_started = Instant::now();
+            if let Err(error) = reader.read_exact(&mut bytes) {
+                if error.kind() != std::io::ErrorKind::UnexpectedEof {
+                    let _ = prepared_tx.send(Err(format!("Could not decode video frame: {error}")));
+                }
+                break;
+            }
+            let decode = decode_started.elapsed();
+            let Some(image) = ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, bytes) else {
+                let _ = prepared_tx.send(Err("Could not construct video frame".into()));
+                break;
+            };
+            let prepared =
+                prepare_video_frame(image, pipeline_model_id, &quality_for_pipeline, input);
+            if prepared_tx
+                .send(prepared.map(|frame| (frame, decode)))
+                .is_err()
+            {
+                break;
+            }
+            while let Ok(recycled) = recycle_rx.try_recv() {
+                buffers.push_back(recycled);
+            }
+        }
+        Ok::<(), String>(())
+    });
     let mut composited = Vec::with_capacity(frame_size);
     let mut frame_count = 0_u64;
     let mut ewma: Option<f64> = None;
     let mut stabilizer = TemporalMaskStabilizer::default();
+    let mut last_progress_emit = Instant::now();
+    let mut performance = PerformanceMetrics {
+        decode_ms: 0.0,
+        preprocess_ms: 0.0,
+        inference_ms: 0.0,
+        postprocess_ms: 0.0,
+        temporal_and_composite_ms: 0.0,
+        encode_ms: 0.0,
+        first_inference_ms: None,
+    };
     let result = loop {
         if control.cancelled.load(Ordering::SeqCst) {
             break Err("cancelled".into());
         }
-        match reader.read_exact(&mut bytes) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break Ok(()),
-            Err(error) => break Err(format!("Could not decode video frame: {error}")),
-        }
+        let (prepared, decode) = match prepared_rx.recv() {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(error)) => break Err(error),
+            Err(_) => break Ok(()),
+        };
+        performance.decode_ms += decode.as_secs_f64() * 1000.0;
         let frame_started = Instant::now();
-        let image =
-            match ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, std::mem::take(&mut bytes)) {
-                Some(image) => image,
-                None => break Err("Could not construct video frame".into()),
-            };
-        let frame = DynamicImage::ImageRgb8(image);
-        let mut cutout = match masker.apply(&frame, edge_detail, quality, control) {
+        let mut cutout = match masker.apply_prepared(&prepared, edge_detail, control) {
             Ok(cutout) => cutout,
             Err(error) => break Err(error),
         };
-        if let Err(error) = stabilizer.apply(frame.as_bytes(), &mut cutout) {
+        let timing = masker.last_timing();
+        performance.preprocess_ms += timing.preprocess.as_secs_f64() * 1000.0;
+        performance.inference_ms += timing.inference.as_secs_f64() * 1000.0;
+        performance.postprocess_ms += timing.postprocess.as_secs_f64() * 1000.0;
+        performance
+            .first_inference_ms
+            .get_or_insert(timing.inference.as_secs_f64() * 1000.0);
+        let temporal_started = Instant::now();
+        if let Err(error) = stabilizer.apply_and_composite(
+            prepared.source_bytes(),
+            &mut cutout,
+            screen_color,
+            &mut composited,
+        ) {
             break Err(error);
         }
-        bytes = match frame {
-            DynamicImage::ImageRgb8(image) => image.into_raw(),
-            _ => unreachable!("video frames are decoded as RGB8"),
-        };
-        composite_screen_into(&cutout, screen_color, &mut composited);
+        performance.temporal_and_composite_ms += temporal_started.elapsed().as_secs_f64() * 1000.0;
         masker.recycle_cutout(cutout);
+        let encode_started = Instant::now();
         if let Err(error) = writer.write_all(&composited) {
             break Err(format!("Could not encode video frame: {error}"));
         }
+        performance.encode_ms += encode_started.elapsed().as_secs_f64() * 1000.0;
+        let _ = recycle_tx.send(prepared.into_recycling_parts());
         frame_count += 1;
         let seconds = frame_started.elapsed().as_secs_f64();
         ewma = Some(ewma.map(|old| old * 0.8 + seconds * 0.2).unwrap_or(seconds));
         let eta = (frame_count >= 3 && total > frame_count)
             .then(|| (ewma.unwrap_or(0.0) * (total - frame_count) as f64).ceil() as u64);
-        if let Some(app) = app {
+        if let Some(app) = app.filter(|_| {
+            frame_count == total || last_progress_emit.elapsed() >= Duration::from_millis(200)
+        }) {
             emit_progress(
                 app,
                 control,
@@ -942,15 +1031,23 @@ fn process_video_with_masker(
                     video_encoder.label()
                 ),
             );
+            last_progress_emit = Instant::now();
         }
     };
+    drop(recycle_tx);
     drop(writer);
     if let Err(error) = result {
         kill(&mut decoder);
         kill(&mut encoder);
+        drop(prepared_rx);
+        let _ = pipeline.join();
         let _ = std::fs::remove_file(output);
         return Err(error);
     }
+    let pipeline_result = pipeline
+        .join()
+        .map_err(|_| "Video preprocessing pipeline panicked".to_string())?;
+    pipeline_result?;
     let decoder_status = match decoder.wait() {
         Ok(status) => status,
         Err(error) => {
@@ -1001,6 +1098,9 @@ fn process_video_with_masker(
     Ok(VideoOutcome {
         frame_count,
         provider: masker.provider().into(),
+        precision: masker.precision().into(),
+        pipeline: "BiRefNet + 2-buffer temporal pipeline".into(),
+        performance,
         width,
         height,
         frame_rate: output_fps,
@@ -1077,7 +1177,7 @@ mod tests {
     #[test]
     fn quality_modes_have_distinct_video_profiles() {
         assert_eq!(encoding_profile(QualityMode::Fast), ("23", "veryfast"));
-        assert_eq!(encoding_profile(QualityMode::Balanced), ("18", "medium"));
+        assert_eq!(encoding_profile(QualityMode::Balanced), ("19", "fast"));
         assert_eq!(encoding_profile(QualityMode::Maximum), ("16", "slow"));
     }
 
@@ -1091,7 +1191,7 @@ mod tests {
         let mut software = Vec::new();
         append_video_encoder_args(&mut software, QualityMode::Balanced, VideoEncoder::Software);
         assert!(software.iter().any(|value| value == "libx264"));
-        assert!(software.iter().any(|value| value == "medium"));
+        assert!(software.iter().any(|value| value == "fast"));
     }
 
     #[test]

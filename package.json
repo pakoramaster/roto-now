@@ -1,14 +1,15 @@
 {
   "name": "roto-now",
   "private": true,
-  "version": "0.3.3",
+  "version": "0.4.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "verify:release": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-release.ps1",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:build:all-models": "pwsh -NoProfile -File scripts/build-local-all-models.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",

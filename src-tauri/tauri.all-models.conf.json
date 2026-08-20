@@ -1,0 +1,13 @@
+{
+  "bundle": {
+    "resources": [
+      "bin/ffmpeg.exe",
+      "bin/ffprobe.exe",
+      "models/birefnet-general-lite.onnx",
+      "models/birefnet-general-lite-fp16.onnx",
+      "models/birefnet-general.onnx",
+      "models/birefnet-toonout-fp16.onnx",
+      "THIRD_PARTY_NOTICES.md"
+    ]
+  }
+}

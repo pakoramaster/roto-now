@@ -266,15 +266,25 @@ fn start_image_job(
                     );
                     let cutout = masker.apply(&source, edge_detail, &quality, &control)?;
                     save_cutout(&cutout, &output)?;
+                    let timing = masker.last_timing();
                     Ok((
                         masker.provider().to_string(),
-                        source.width() as u64 * source.height() as u64,
+                        masker.precision().to_string(),
+                        jobs::PerformanceMetrics {
+                            decode_ms: 0.0,
+                            preprocess_ms: timing.preprocess.as_secs_f64() * 1000.0,
+                            inference_ms: timing.inference.as_secs_f64() * 1000.0,
+                            postprocess_ms: timing.postprocess.as_secs_f64() * 1000.0,
+                            temporal_and_composite_ms: 0.0,
+                            encode_ms: 0.0,
+                            first_inference_ms: Some(timing.inference.as_secs_f64() * 1000.0),
+                        },
                     ))
                 },
             )
         })();
         match outcome {
-            Ok((provider, _)) => emit(
+            Ok((provider, precision, performance)) => emit(
                 &app_for_task,
                 JobEvent::Completed {
                     job_id: control.id.clone(),
@@ -282,6 +292,9 @@ fn start_image_job(
                         output_path: output.to_string_lossy().into_owned(),
                         model: models::spec(model_id).name.into(),
                         provider,
+                        precision,
+                        pipeline: "single image".into(),
+                        performance: Some(performance),
                         duration_ms: started.elapsed().as_millis() as u64,
                         frame_count: None,
                         width: None,
@@ -389,6 +402,9 @@ fn start_video_job(
                         output_path: output.to_string_lossy().into_owned(),
                         model: models::spec(model_id).name.into(),
                         provider: value.provider,
+                        precision: value.precision,
+                        pipeline: value.pipeline,
+                        performance: Some(value.performance),
                         duration_ms: started.elapsed().as_millis() as u64,
                         frame_count: Some(value.frame_count),
                         width: Some(value.width),
