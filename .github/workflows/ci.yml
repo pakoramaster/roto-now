@@ -44,7 +44,8 @@ jobs:
           $resources = @(
             "src-tauri/bin/ffmpeg.exe",
             "src-tauri/bin/ffprobe.exe",
-            "src-tauri/models/birefnet-general-lite.onnx"
+            "src-tauri/models/birefnet-general-lite.onnx",
+            "src-tauri/models/birefnet-general-lite-fp16.onnx"
           )
 
           foreach ($resource in $resources) {

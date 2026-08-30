@@ -27,6 +27,10 @@ jobs:
           node-version: 22
           cache: npm
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
@@ -41,6 +45,12 @@ jobs:
       - name: Fetch and verify FFmpeg 8.1.2
         shell: pwsh
         run: ./scripts/fetch-ffmpeg.ps1
+
+      - name: Prepare model conversion environment
+        shell: pwsh
+        run: |
+          python -m venv .python-env
+          ./.python-env/Scripts/python.exe -m pip install --disable-pip-version-check -r scripts/requirements-model-conversion.txt
 
       - name: Fetch and verify bundled General Lite
         shell: pwsh
