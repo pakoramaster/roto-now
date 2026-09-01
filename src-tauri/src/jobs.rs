@@ -48,6 +48,31 @@ pub struct ProcessResult {
     pub media_duration_seconds: Option<f64>,
     pub has_audio: Option<bool>,
     pub preview: bool,
+    pub seed: bool,
+    pub source_frame_path: Option<String>,
+}
+
+impl ProcessResult {
+    pub fn model_download(name: &str) -> Self {
+        Self {
+            output_path: String::new(),
+            model: name.into(),
+            provider: "installed".into(),
+            precision: "n/a".into(),
+            pipeline: "model download".into(),
+            performance: None,
+            duration_ms: 0,
+            frame_count: None,
+            width: None,
+            height: None,
+            frame_rate: None,
+            media_duration_seconds: None,
+            has_audio: None,
+            preview: false,
+            seed: false,
+            source_frame_path: None,
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]

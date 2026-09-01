@@ -37,6 +37,7 @@ pub struct BootstrapStatus {
     pub ready: bool,
     pub provider: &'static str,
     pub models: Vec<ModelStatus>,
+    pub trackers: Vec<crate::cutie_models::CutieStatus>,
 }
 
 pub struct ModelSpec {
@@ -251,6 +252,7 @@ pub fn get_bootstrap_status(app: AppHandle) -> Result<BootstrapStatus, String> {
             .any(|item| item.id == ModelId::GeneralLite && item.installed),
         provider: "DirectML with CPU fallback",
         models,
+        trackers: crate::cutie_models::statuses(&app),
     })
 }
 
@@ -461,22 +463,7 @@ pub fn download_model(
                 &app_for_task,
                 JobEvent::Completed {
                     job_id: control.id.clone(),
-                    result: crate::jobs::ProcessResult {
-                        output_path: String::new(),
-                        model: item.name.into(),
-                        provider: "installed".into(),
-                        precision: "n/a".into(),
-                        pipeline: "model download".into(),
-                        performance: None,
-                        duration_ms: 0,
-                        frame_count: None,
-                        width: None,
-                        height: None,
-                        frame_rate: None,
-                        media_duration_seconds: None,
-                        has_audio: None,
-                        preview: false,
-                    },
+                    result: crate::jobs::ProcessResult::model_download(item.name),
                 },
             );
         }

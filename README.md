@@ -8,7 +8,7 @@
   No account, no uploads, and no separate Python or FFmpeg setup.
 </div>
 
-> **Beta:** The main image and video workflows are usable. General and Anime video use motion-aware temporal stabilization. See [Current limitations](#current-limitations) before production work.
+> **Beta:** The main image and video workflows are usable. Video offers the existing motion-aware temporal mode and optional Cutie primary-subject tracking. See [Current limitations](#current-limitations) before production work.
 
 ---
 
@@ -25,6 +25,8 @@
 
 - Open MP4, MOV, or WebM files.
 - Preview one processed frame before committing to a full export.
+- Choose lightweight three-frame temporal stabilization or sequential Cutie primary-subject tracking.
+- Seed Cutie from a General or Anime first-frame mask, or attach your own PNG subject mask, then refine it with Add Subject and Remove brushes.
 - Export an H.264 MP4 with a green or blue background.
 - Keep the source audio, orientation, aspect ratio, and practical playback timing.
 - Smooth masks between nearby frames and guard against brief full-screen colour flashes.
@@ -48,9 +50,10 @@ Windows may show a SmartScreen warning while beta installers are unsigned. Check
 1. Open Roto Now and choose **Browse files**.
 2. Pick **General** for people, animals, products, and photos, or **Anime** for illustrations and line art.
 3. Choose a quality mode. **Balanced** is the best starting point for most work.
-4. For video, move the playhead and use **Preview frame** to check the mask and screen colour.
-5. Select **Remove background** or **Process full video**.
-6. Compare **Input** and **Output**, make brush corrections to images if needed, then save the result.
+4. For video, move the playhead and use **Preview frame** to check the selected detection model and screen colour.
+5. Keep **Temporal** and select General Lite, General Maximum, or Anime for per-frame segmentation; or select **Primary Subject**, choose a model to generate the frame-0 mask (or attach your own PNG), remove unwanted furniture/background from it, and confirm the mask.
+6. Select **Remove background**, **Process full video**, or **Track primary subject**.
+7. Compare **Input** and **Output**, make brush corrections to images if needed, then save the result.
 
 Your original file is never overwritten. Roto Now creates a temporary result first and only opens a Save dialog after processing succeeds.
 
@@ -58,26 +61,37 @@ Your original file is never overwritten. Roto Now creates a temporary result fir
 
 | Setting | Best for | Trade-off |
 | --- | --- | --- |
-| **Fast** | Quick drafts and longer videos | Fastest resampling and export; softer fine edges |
-| **Balanced** | Most images and videos | Good edge detail with a faster practical export |
-| **Maximum** | Difficult stills and short quality-focused clips | Larger model and slower, higher-quality processing |
-| **Edge detail** | Hair, fur, and soft boundaries | Higher values preserve more soft detail but may retain background haze |
+| **Image quality — Fast** | Quick image drafts | Fastest resampling; softer fine edges |
+| **Image quality — Balanced** | Most images | Good edge detail with faster processing |
+| **Image quality — Maximum** | Difficult quality-focused images | General Maximum model with slower processing |
+| **Temporal model** | Choosing per-frame video segmentation | General Lite is fastest; General Maximum adds detail; Anime handles stylized footage |
+| **First-frame mask model** | Creating a Primary Subject tracking seed | Used only for the editable first-frame mask, not subsequent Cutie tracking |
+| **Edge detail** | Images and Temporal video | Higher values preserve more soft detail but may retain background haze |
 | **Green / Blue** | Video editing and keying | Choose the colour least present in the subject |
+| **Temporal** | Fast exports with modest flicker reduction | Still segments every frame independently; semantic inclusions can change |
+| **Primary Subject — Balanced** | One person or object that must remain consistent | 640×368 internal tracking; recommended speed, memory, and quality balance |
+| **Primary Subject — High Detail** | Fine edges and thin structures in tracked video | Optional 126 MB download; 960×544 internal tracking, higher GPU memory use, and slower processing |
 
-**General Lite** ships with the app and powers Fast and Balanced. Its DirectML path uses mixed-precision weights and automatically falls back to the original FP32 model on CPU. **General Maximum** and **Anime** can be installed when needed from the model manager.
+**General Lite** ships with the app and powers Fast and Balanced image processing. Its DirectML path uses mixed-precision weights and automatically falls back to the original FP32 model on CPU. **General Maximum** and **Anime** can be installed when needed from the model manager.
+
+Video model selection is explicit: Temporal uses the selected model for every frame, while Primary Subject uses it only to create the editable first-frame mask. Primary Subject tracking quality is controlled separately by the selected Cutie tier.
+
+**Cutie Primary Subject** offers two independent optional four-network ONNX packages from the model manager. Balanced uses 640×368 internally and remains the default. High Detail uses 960×544 for better edges and thin structures while reusing the exact same first-frame mask workflow. Roto Now runs both locally with DirectML and CPU fallback. The first-frame mask is the tracking contract: anything included there may be followed, so erase chairs, beds, and other unwanted regions before export.
 
 ## Tips for better results
 
 - Use footage with a clear subject and reasonable contrast from the background.
 - Preview a representative video frame before processing the full clip.
-- Start with Balanced and the default edge detail, then adjust only if the boundary looks too hard or too hazy.
+- For images, start with Balanced. For Temporal video, start with General Lite. Adjust Edge detail only if the boundary looks too hard or too hazy.
 - Choose blue screen when the subject contains green clothing or props, and green screen when the subject contains blue.
 - Use the Restore and Erase brushes for small image corrections instead of rerunning the whole image repeatedly.
+- For Primary Subject video, start from the General or Anime mask that best isolates the subject, or attach a transparent PNG/opaque black-and-white PNG when you already have a clean mask. White marks the subject, black marks the background. The mask may use different dimensions but must match the video's aspect ratio; it remains editable before tracking.
 
 ## Current limitations
 
 - Windows is the supported desktop platform during beta.
-- General and Anime still infer each frame independently before the video-native temporal matte stage; they do not perform object tracking.
+- Temporal mode still infers each frame independently before a three-frame, motion-gated temporal matte stage; it does not perform object tracking.
+- Cutie tracks the marked primary subject sequentially, but it can drift after long occlusions, abrupt cuts, or when the frame-0 mask contains other objects. It does not automatically re-seed at scene cuts.
 - Fast motion, motion blur, transparent objects, fine flyaway hair, and low subject/background contrast can still produce unstable edges.
 - Video output uses a solid green or blue screen because common H.264 MP4 playback does not support transparent alpha video.
 - One processing or model-download job runs at a time.
@@ -106,6 +120,14 @@ The development script downloads and verifies the pinned FFmpeg build and config
 .models/rembg/birefnet-general-lite.onnx
 .models/rembg/birefnet-general.onnx
 .models/toonout/birefnet-toonout-fp16.onnx
+.models/cutie-medium/cutie-encode-key-640x368.onnx
+.models/cutie-medium/cutie-encode-value-640x368.onnx
+.models/cutie-medium/cutie-memory-readout-floatmask-valid-640x368-m6-topk30-opencv.onnx
+.models/cutie-medium/cutie-decode-640x368.onnx
+.models/cutie-high/cutie-encode-key-960x544.onnx
+.models/cutie-high/cutie-encode-value-960x544.onnx
+.models/cutie-high/cutie-memory-readout-floatmask-valid-960x544-m6-topk30-opencv.onnx
+.models/cutie-high/cutie-decode-960x544.onnx
 ```
 
 Release builds do not use these developer fallback paths. Optional production models are stored in Roto Now's per-user app-data folder.

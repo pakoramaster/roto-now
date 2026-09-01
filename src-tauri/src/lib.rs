@@ -1,4 +1,6 @@
 pub mod corrections;
+pub mod cutie;
+pub mod cutie_models;
 pub mod inference;
 pub mod jobs;
 pub mod models;
@@ -303,6 +305,8 @@ fn start_image_job(
                         media_duration_seconds: None,
                         has_audio: None,
                         preview: false,
+                        seed: false,
+                        source_frame_path: None,
                     },
                 },
             ),
@@ -356,8 +360,31 @@ fn start_video_job(
     screen_color: String,
     preview: bool,
     start_seconds: Option<f64>,
+    tracking_mode: Option<String>,
+    seed_mask_path: Option<String>,
+    tracker_quality: Option<String>,
 ) -> Result<String, String> {
     let input = verify_input(&input_path, "video")?;
+    let tracking_mode = tracking_mode.unwrap_or_else(|| "temporal".into());
+    if !matches!(tracking_mode.as_str(), "temporal" | "cutie") {
+        return Err("Unknown video tracking mode".into());
+    }
+    let seed_mask = seed_mask_path.map(PathBuf::from);
+    let cutie_tier =
+        cutie_models::CutieTier::parse(tracker_quality.as_deref().unwrap_or("balanced"))?;
+    if tracking_mode == "cutie" {
+        let path = seed_mask
+            .as_ref()
+            .ok_or("Primary Subject mode requires a first-frame mask")?;
+        if outputs.outputs.lock().get(path) != Some(&false) || !is_managed_output_file(path) {
+            return Err("Choose a first-frame mask created by Roto Now".into());
+        }
+        if !cutie_models::model_paths(&app, cutie_tier)?.all_exist() {
+            return Err(
+                "The selected Cutie quality tier must be downloaded before processing".into(),
+            );
+        }
+    }
     if !matches!(screen_color.as_str(), "green" | "blue") {
         return Err("Screen colour must be green or blue".into());
     }
@@ -368,7 +395,7 @@ fn start_video_job(
         quality_mode
     };
     let model_id = routing::select_model(&model, selected_quality)?;
-    if !models::model_path(&app, model_id)?.is_file() {
+    if (preview || tracking_mode == "temporal") && !models::model_path(&app, model_id)?.is_file() {
         return Err(format!(
             "{} must be downloaded before processing",
             models::spec(model_id).name
@@ -392,6 +419,9 @@ fn start_video_job(
             &screen_color,
             preview,
             start_seconds.unwrap_or(0.0),
+            &tracking_mode,
+            seed_mask.as_deref(),
+            cutie_tier,
         );
         match outcome {
             Ok(value) => emit(
@@ -400,7 +430,14 @@ fn start_video_job(
                     job_id: control.id.clone(),
                     result: ProcessResult {
                         output_path: output.to_string_lossy().into_owned(),
-                        model: models::spec(model_id).name.into(),
+                        model: if tracking_mode == "cutie" {
+                            match cutie_tier {
+                                cutie_models::CutieTier::Balanced => "Cutie Balanced".into(),
+                                cutie_models::CutieTier::High => "Cutie High Detail".into(),
+                            }
+                        } else {
+                            models::spec(model_id).name.into()
+                        },
                         provider: value.provider,
                         precision: value.precision,
                         pipeline: value.pipeline,
@@ -413,6 +450,8 @@ fn start_video_job(
                         media_duration_seconds: Some(value.duration),
                         has_audio: Some(value.has_audio),
                         preview,
+                        seed: false,
+                        source_frame_path: None,
                     },
                 },
             ),
@@ -440,6 +479,143 @@ fn start_video_job(
                     .outputs
                     .lock()
                     .remove(&output);
+                emit(
+                    &app_for_task,
+                    JobEvent::Failed {
+                        job_id: control.id.clone(),
+                        error,
+                    },
+                );
+            }
+        }
+        app_for_task.state::<JobState>().finish(&control.id);
+    });
+    Ok(job_id)
+}
+
+#[tauri::command]
+fn start_video_seed_job(
+    app: AppHandle,
+    jobs: State<'_, JobState>,
+    outputs: State<'_, OutputState>,
+    input_path: String,
+    model: String,
+    quality: String,
+    edge_detail: u8,
+    custom_mask_path: Option<String>,
+) -> Result<String, String> {
+    let input = verify_input(&input_path, "video")?;
+    let imported_mask = custom_mask_path.map(PathBuf::from);
+    if let Some(path) = imported_mask.as_ref() {
+        if !app.asset_protocol_scope().is_allowed(path) {
+            return Err("Choose the subject mask through Roto Now's file picker".into());
+        }
+        let metadata = fs::metadata(path)
+            .map_err(|error| format!("Could not inspect the attached mask: {error}"))?;
+        if !metadata.is_file()
+            || path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+                != Some("png")
+        {
+            return Err("The first-frame subject mask must be a PNG file".into());
+        }
+        if metadata.len() > MAX_IMAGE_BYTES {
+            return Err("The attached mask is too large (maximum 256 MB)".into());
+        }
+    }
+    let quality_mode = routing::QualityMode::parse(&quality)?;
+    let model_id = routing::select_model(&model, quality_mode)?;
+    if imported_mask.is_none() && !models::model_path(&app, model_id)?.is_file() {
+        return Err(format!(
+            "{} must be downloaded before creating a first-frame mask",
+            models::spec(model_id).name
+        ));
+    }
+    let source_output = new_managed_output("png")?;
+    let seed_output = new_managed_output("png")?;
+    let control = jobs.begin()?;
+    let job_id = control.id.clone();
+    let app_for_task = app.clone();
+    {
+        let mut registered = outputs.outputs.lock();
+        registered.insert(source_output.clone(), false);
+        registered.insert(seed_output.clone(), false);
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let started = Instant::now();
+        let outcome = video::create_video_seed(
+            &app_for_task,
+            &control,
+            &input,
+            &source_output,
+            &seed_output,
+            model_id,
+            edge_detail,
+            &quality,
+            imported_mask.as_deref(),
+        );
+        match outcome {
+            Ok(value) => emit(
+                &app_for_task,
+                JobEvent::Completed {
+                    job_id: control.id.clone(),
+                    result: ProcessResult {
+                        output_path: seed_output.to_string_lossy().into_owned(),
+                        model: if imported_mask.is_some() {
+                            "Attached PNG mask".into()
+                        } else {
+                            models::spec(model_id).name.into()
+                        },
+                        provider: value.provider,
+                        precision: value.precision,
+                        pipeline: if imported_mask.is_some() {
+                            "editable attached Cutie seed".into()
+                        } else {
+                            "editable model-derived Cutie seed".into()
+                        },
+                        performance: Some(value.performance),
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        frame_count: Some(1),
+                        width: Some(value.width),
+                        height: Some(value.height),
+                        frame_rate: None,
+                        media_duration_seconds: None,
+                        has_audio: None,
+                        preview: false,
+                        seed: true,
+                        source_frame_path: Some(source_output.to_string_lossy().into_owned()),
+                    },
+                },
+            ),
+            Err(error)
+                if error == "cancelled"
+                    || control.cancelled.load(std::sync::atomic::Ordering::SeqCst) =>
+            {
+                let _ = fs::remove_file(&source_output);
+                let _ = fs::remove_file(&seed_output);
+                let output_state = app_for_task.state::<OutputState>();
+                let mut registered = output_state.outputs.lock();
+                registered.remove(&source_output);
+                registered.remove(&seed_output);
+                drop(registered);
+                emit(
+                    &app_for_task,
+                    JobEvent::Cancelled {
+                        job_id: control.id.clone(),
+                    },
+                );
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&source_output);
+                let _ = fs::remove_file(&seed_output);
+                let output_state = app_for_task.state::<OutputState>();
+                let mut registered = output_state.outputs.lock();
+                registered.remove(&source_output);
+                registered.remove(&seed_output);
+                drop(registered);
                 emit(
                     &app_for_task,
                     JobEvent::Failed {
@@ -512,6 +688,34 @@ fn apply_image_corrections(
 }
 
 #[tauri::command]
+fn apply_video_seed_corrections(
+    outputs: State<'_, OutputState>,
+    source_path: String,
+    strokes: Vec<corrections::CorrectionStroke>,
+) -> Result<String, String> {
+    let source = PathBuf::from(&source_path);
+    if outputs.outputs.lock().get(&source) != Some(&false)
+        || !is_managed_output_file(&source)
+        || source.extension().and_then(|value| value.to_str()) != Some("png")
+    {
+        return Err("Only a managed first-frame mask can be corrected".into());
+    }
+    let mut image = image::open(&source)
+        .map_err(|error| format!("Could not open the first-frame mask: {error}"))?
+        .to_rgba8();
+    corrections::apply_corrections(&mut image, &strokes)?;
+    if !image.pixels().any(|pixel| pixel[3] >= 128) {
+        return Err("Mark at least part of the primary subject before using this mask".into());
+    }
+    let output = new_managed_output("png")?;
+    image
+        .save_with_format(&output, image::ImageFormat::Png)
+        .map_err(|error| format!("Could not save the corrected first-frame mask: {error}"))?;
+    outputs.outputs.lock().insert(output.clone(), false);
+    Ok(output.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
 fn discard_output(outputs: State<'_, OutputState>, path: String) -> Result<(), String> {
     let output = PathBuf::from(path);
     let mut registered = outputs.outputs.lock();
@@ -547,16 +751,21 @@ pub fn run() {
         .manage(JobState::default())
         .manage(OutputState::default())
         .manage(ModelSessionCache::default())
+        .manage(cutie::CutieSessionCache::default())
         .invoke_handler(tauri::generate_handler![
             engine_status,
             inspect_media,
             models::get_bootstrap_status,
             models::download_model,
             models::remove_model,
+            cutie_models::download_cutie,
+            cutie_models::remove_cutie,
             models::cancel_job,
             start_image_job,
             start_video_job,
+            start_video_seed_job,
             apply_image_corrections,
+            apply_video_seed_corrections,
             save_output,
             discard_output
         ])
