@@ -29,3 +29,14 @@ Roto Now uses ONNX Runtime through pinned `ort` 2.0.0-rc.12. See https://github.
 - Upstream project: https://github.com/ZhengPeng7/BiRefNet
 
 The model is distributed under the MIT license. License and source information are available from the projects above.
+
+## Cutie Primary Subject model (optional download)
+
+- Balanced package: OpenShot ONNX Cutie medium 640x368, release `v0.2.0`
+- Balanced package SHA-256: `64F79A30D4E53F2AAD597772968F18DCC3806EF8FBE1FEFCBF4B58FAC069709`
+- High Detail package: OpenShot ONNX Cutie high 960x544, release `v0.2.0`
+- High Detail package SHA-256: `56C5B4823610C8F87B551B82893EF0450F900C254B4FF729F24AEC30DEA2124F`
+- Distribution source: https://github.com/OpenShot/openshot-onnx
+- Upstream Cutie project: https://github.com/hkchengrex/Cutie
+
+Cutie and the OpenShot ONNX export tooling are available under the MIT license. The optional weights are downloaded only when the user installs Cutie Primary Subject from the model manager. License and source information are available from the projects above.

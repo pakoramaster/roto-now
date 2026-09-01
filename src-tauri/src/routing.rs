@@ -32,10 +32,14 @@ impl QualityMode {
 pub fn select_model(requested: &str, quality: QualityMode) -> Result<ModelId, String> {
     if requested.eq_ignore_ascii_case("anime") {
         Ok(ModelId::Anime)
+    } else if requested.eq_ignore_ascii_case("general lite") {
+        Ok(ModelId::GeneralLite)
+    } else if requested.eq_ignore_ascii_case("general maximum") {
+        Ok(ModelId::General)
     } else if requested.eq_ignore_ascii_case("general") {
         Ok(quality.general_model())
     } else {
-        Err("Detection model must be General or Anime".into())
+        Err("Detection model must be General, General Lite, General Maximum, or Anime".into())
     }
 }
 
@@ -58,6 +62,14 @@ mod tests {
         assert_eq!(
             select_model("Anime", QualityMode::Balanced).unwrap(),
             ModelId::Anime
+        );
+        assert_eq!(
+            select_model("General Lite", QualityMode::Maximum).unwrap(),
+            ModelId::GeneralLite
+        );
+        assert_eq!(
+            select_model("General Maximum", QualityMode::Fast).unwrap(),
+            ModelId::General
         );
         assert!(select_model("Auto", QualityMode::Balanced).is_err());
     }

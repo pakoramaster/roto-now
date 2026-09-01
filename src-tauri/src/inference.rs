@@ -204,6 +204,10 @@ impl ModelSessionCache {
             *active = None;
         }
     }
+
+    pub fn invalidate_all(&self) {
+        *self.active.lock() = None;
+    }
 }
 
 impl Masker {

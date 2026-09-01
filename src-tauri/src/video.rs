@@ -1,11 +1,11 @@
 use crate::{
-    inference::{composite_screen, prepare_video_frame, Masker, PreparedFrame},
+    inference::{composite_screen, prepare_video_frame, save_cutout, Masker, PreparedFrame},
     jobs::{emit_progress, JobControl, PerformanceMetrics},
     models::ModelId,
     routing::QualityMode,
     temporal::TemporalMaskStabilizer,
 };
-use image::{DynamicImage, ImageBuffer, Rgb};
+use image::{DynamicImage, GrayImage, ImageBuffer, Luma, Rgb};
 use serde::Deserialize;
 use std::{
     collections::VecDeque,
@@ -511,6 +511,251 @@ pub struct VideoOutcome {
     pub has_audio: bool,
 }
 
+pub struct SeedOutcome {
+    pub provider: String,
+    pub precision: String,
+    pub width: u32,
+    pub height: u32,
+    pub performance: PerformanceMetrics,
+}
+
+fn prepare_imported_seed(
+    frame: &ImageBuffer<Rgb<u8>, Vec<u8>>,
+    supplied: DynamicImage,
+) -> Result<(image::RgbaImage, &'static str), String> {
+    let source_ratio = frame.width() as f64 / frame.height().max(1) as f64;
+    let mask_ratio = supplied.width() as f64 / supplied.height().max(1) as f64;
+    if (mask_ratio / source_ratio - 1.0).abs() > 0.02 {
+        return Err("The attached mask must have the same aspect ratio as the video frame".into());
+    }
+    let rgba = supplied.to_rgba8();
+    let has_transparency = rgba.pixels().any(|pixel| pixel[3] < 255);
+    let alpha = if has_transparency {
+        GrayImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+            Luma([rgba.get_pixel(x, y)[3]])
+        })
+    } else {
+        let luminance = DynamicImage::ImageRgba8(rgba).to_luma8();
+        let (minimum, maximum) = luminance
+            .pixels()
+            .fold((u8::MAX, u8::MIN), |(low, high), pixel| {
+                (low.min(pixel[0]), high.max(pixel[0]))
+            });
+        if (minimum > 64 || maximum < 191) && minimum < 128 && maximum >= 128 {
+            return Err(
+                "An opaque mask PNG must use white for the subject and black for the background"
+                    .into(),
+            );
+        }
+        luminance
+    };
+    let alpha = if alpha.dimensions() == frame.dimensions() {
+        alpha
+    } else {
+        image::imageops::resize(
+            &alpha,
+            frame.width(),
+            frame.height(),
+            image::imageops::FilterType::CatmullRom,
+        )
+    };
+    if !alpha.pixels().any(|pixel| pixel[0] >= 128) {
+        return Err("The attached mask does not contain a foreground subject".into());
+    }
+    if !alpha.pixels().any(|pixel| pixel[0] < 128) {
+        return Err("The attached mask must leave some background outside the subject".into());
+    }
+    let cutout = image::RgbaImage::from_fn(frame.width(), frame.height(), |x, y| {
+        let pixel = frame.get_pixel(x, y);
+        image::Rgba([pixel[0], pixel[1], pixel[2], alpha.get_pixel(x, y)[0]])
+    });
+    Ok((
+        cutout,
+        if has_transparency {
+            "alpha"
+        } else {
+            "luminance"
+        },
+    ))
+}
+
+fn decode_first_frame(
+    ffmpeg: &Path,
+    input: &Path,
+    meta: &VideoMeta,
+) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>, String> {
+    let (width, height) = preview_dimensions(meta.width, meta.height);
+    let decoded = background_command(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(input)
+        .args([
+            "-frames:v",
+            "1",
+            "-vf",
+            &scale_to_rgb_filter(width, height, &meta.color),
+            "-an",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ])
+        .output()
+        .map_err(|error| format!("Could not decode the first video frame: {error}"))?;
+    if !decoded.status.success() {
+        let details = String::from_utf8_lossy(&decoded.stderr).trim().to_string();
+        return Err(if details.is_empty() {
+            "FFmpeg could not decode the first video frame".into()
+        } else {
+            format!("FFmpeg could not decode the first video frame: {details}")
+        });
+    }
+    ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, decoded.stdout)
+        .ok_or_else(|| "FFmpeg returned an incomplete first video frame".into())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_video_seed(
+    app: &AppHandle,
+    control: &JobControl,
+    input: &Path,
+    source_output: &Path,
+    seed_output: &Path,
+    model_id: ModelId,
+    edge_detail: u8,
+    quality: &str,
+    imported_mask: Option<&Path>,
+) -> Result<SeedOutcome, String> {
+    let ffmpeg = bundled_binary(app, "ffmpeg")?;
+    let ffprobe = bundled_binary(app, "ffprobe")?;
+    let meta = probe(&ffprobe, input)?;
+    emit_progress(
+        app,
+        control,
+        "decodingSeed",
+        Some(0),
+        Some(1),
+        None,
+        "Decoding the first video frame",
+    );
+    let decode_started = Instant::now();
+    let frame = decode_first_frame(&ffmpeg, input, &meta)?;
+    let decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+    frame
+        .save_with_format(source_output, image::ImageFormat::Png)
+        .map_err(|error| format!("Could not save the first video frame: {error}"))?;
+    if control.cancelled.load(Ordering::SeqCst) {
+        return Err("cancelled".into());
+    }
+
+    if let Some(mask_path) = imported_mask {
+        emit_progress(
+            app,
+            control,
+            "preparingSeed",
+            Some(0),
+            Some(1),
+            None,
+            "Preparing the attached first-frame mask",
+        );
+        let supplied = image::open(mask_path)
+            .map_err(|error| format!("Could not open the attached PNG mask: {error}"))?;
+        let (cutout, mask_kind) = prepare_imported_seed(&frame, supplied)?;
+        cutout
+            .save_with_format(seed_output, image::ImageFormat::Png)
+            .map_err(|error| format!("Could not save the attached first-frame mask: {error}"))?;
+        emit_progress(
+            app,
+            control,
+            "preparingSeed",
+            Some(1),
+            Some(1),
+            None,
+            "Attached first-frame mask ready to refine",
+        );
+        return Ok(SeedOutcome {
+            provider: "Imported".into(),
+            precision: mask_kind.into(),
+            width: frame.width(),
+            height: frame.height(),
+            performance: PerformanceMetrics {
+                decode_ms,
+                preprocess_ms: 0.0,
+                inference_ms: 0.0,
+                postprocess_ms: 0.0,
+                temporal_and_composite_ms: 0.0,
+                encode_ms: 0.0,
+                first_inference_ms: None,
+            },
+        });
+    }
+
+    app.state::<crate::cutie::CutieSessionCache>().invalidate();
+    let model_path = crate::models::model_path(app, model_id)?;
+    app.state::<crate::inference::ModelSessionCache>()
+        .with_model(
+            model_path,
+            model_id,
+            model_id != ModelId::General,
+            || {
+                emit_progress(
+                    app,
+                    control,
+                    "loadingModel",
+                    None,
+                    None,
+                    None,
+                    "Loading first-frame segmentation model",
+                )
+            },
+            |masker, _| {
+                emit_progress(
+                    app,
+                    control,
+                    "preparingSeed",
+                    Some(0),
+                    Some(1),
+                    None,
+                    "Creating the editable first-frame mask",
+                );
+                let cutout = masker.apply(
+                    &DynamicImage::ImageRgb8(frame),
+                    edge_detail,
+                    quality,
+                    control,
+                )?;
+                save_cutout(&cutout, seed_output)?;
+                let timing = masker.last_timing();
+                let outcome = SeedOutcome {
+                    provider: masker.provider().into(),
+                    precision: masker.precision().into(),
+                    width: cutout.width(),
+                    height: cutout.height(),
+                    performance: PerformanceMetrics {
+                        decode_ms,
+                        preprocess_ms: timing.preprocess.as_secs_f64() * 1000.0,
+                        inference_ms: timing.inference.as_secs_f64() * 1000.0,
+                        postprocess_ms: timing.postprocess.as_secs_f64() * 1000.0,
+                        temporal_and_composite_ms: 0.0,
+                        encode_ms: 0.0,
+                        first_inference_ms: Some(timing.inference.as_secs_f64() * 1000.0),
+                    },
+                };
+                masker.recycle_cutout(cutout);
+                emit_progress(
+                    app,
+                    control,
+                    "preparingSeed",
+                    Some(1),
+                    Some(1),
+                    None,
+                    "First-frame mask ready to refine",
+                );
+                Ok(outcome)
+            },
+        )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn process_video(
     app: &AppHandle,
@@ -523,10 +768,50 @@ pub fn process_video(
     screen_color: &str,
     preview: bool,
     start_seconds: f64,
+    tracking_mode: &str,
+    seed_mask: Option<&Path>,
+    cutie_tier: crate::cutie_models::CutieTier,
 ) -> Result<VideoOutcome, String> {
     let ffmpeg = bundled_binary(app, "ffmpeg")?;
     let ffprobe = bundled_binary(app, "ffprobe")?;
     let model_path = crate::models::model_path(app, model_id)?;
+    if !preview && tracking_mode == "cutie" {
+        app.state::<crate::inference::ModelSessionCache>()
+            .invalidate_all();
+        let seed_mask = seed_mask.ok_or("Primary Subject mode requires a first-frame mask")?;
+        let paths = crate::cutie_models::model_paths(app, cutie_tier)?;
+        return app.state::<crate::cutie::CutieSessionCache>().with_tracker(
+            paths,
+            |tracker, reused| {
+                emit_progress(
+                    app,
+                    control,
+                    "loadingModel",
+                    None,
+                    None,
+                    None,
+                    if reused {
+                        "Using loaded Cutie tracker"
+                    } else {
+                        "Loading Cutie tracker"
+                    },
+                );
+                process_video_with_cutie(
+                    Some(app),
+                    control,
+                    input,
+                    output,
+                    tracker,
+                    &ffmpeg,
+                    &ffprobe,
+                    quality,
+                    screen_color,
+                    seed_mask,
+                )
+            },
+        );
+    }
+    app.state::<crate::cutie::CutieSessionCache>().invalidate();
     app.state::<crate::inference::ModelSessionCache>()
         .with_model(
             model_path,
@@ -571,6 +856,323 @@ pub fn process_video(
                 )
             },
         )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_video_with_cutie(
+    app: Option<&AppHandle>,
+    control: &JobControl,
+    input: &Path,
+    output: &Path,
+    tracker: &mut crate::cutie::CutieTracker,
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    quality: &str,
+    screen_color: &str,
+    seed_path: &Path,
+) -> Result<VideoOutcome, String> {
+    let quality_mode = QualityMode::parse(quality)?;
+    let meta = probe(ffprobe, input)?;
+    let (width, height, total) = (meta.width, meta.height, meta.frames);
+    let seed_image = image::open(seed_path)
+        .map_err(|error| format!("Could not open first-frame mask: {error}"))?;
+    let rgba = seed_image.to_rgba8();
+    let has_alpha = rgba.pixels().any(|pixel| pixel[3] < 255);
+    let seed = GrayImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+        let pixel = rgba.get_pixel(x, y);
+        Luma([if has_alpha {
+            pixel[3]
+        } else {
+            ((pixel[0] as u16 + pixel[1] as u16 + pixel[2] as u16) / 3) as u8
+        }])
+    });
+    if !seed.pixels().any(|pixel| pixel[0] >= 128) {
+        return Err("The first-frame mask does not contain a foreground subject".into());
+    }
+    let video_encoder = if tracker.provider() == "DmlExecutionProvider" {
+        VideoEncoder::Software
+    } else {
+        select_video_encoder(ffmpeg, width, height)
+    };
+    if let Some(app) = app {
+        emit_progress(
+            app,
+            control,
+            "processingFrames",
+            Some(0),
+            Some(total),
+            None,
+            format!(
+                "Preparing {} Cutie tracking and {} encoding",
+                tracker.provider().trim_end_matches("ExecutionProvider"),
+                video_encoder.label()
+            ),
+        );
+    }
+
+    let decode_filter = format!(
+        "fps={},{}",
+        meta.fps_arg,
+        scale_to_rgb_filter(width, height, &meta.color)
+    );
+    let mut decoder = background_command(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(input)
+        .args([
+            "-vf",
+            &decode_filter,
+            "-frames:v",
+            &total.to_string(),
+            "-an",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Could not start video decoder: {e}"))?;
+    let clip_duration = meta.duration;
+    let mut encode_args = vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-f".into(),
+        "rawvideo".into(),
+        "-pix_fmt".into(),
+        "rgb24".into(),
+        "-fflags".into(),
+        "+genpts".into(),
+        "-s".into(),
+        format!("{width}x{height}"),
+        "-framerate".into(),
+        meta.fps_arg.clone(),
+        "-i".into(),
+        "pipe:0".into(),
+        "-i".into(),
+        input.to_string_lossy().into_owned(),
+        "-map".into(),
+        "0:v:0".into(),
+    ];
+    if meta.has_audio {
+        encode_args.extend(["-map".into(), "1:a:0?".into()]);
+    } else {
+        encode_args.push("-an".into());
+    }
+    append_video_encoder_args(&mut encode_args, quality_mode, video_encoder);
+    encode_args.extend([
+        "-vf".into(),
+        rgb_to_yuv_filter(&meta.color),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+        "-fps_mode".into(),
+        "cfr".into(),
+        "-map_metadata".into(),
+        "-1".into(),
+        "-metadata:s:v:0".into(),
+        "rotate=0".into(),
+        "-movflags".into(),
+        "+faststart".into(),
+    ]);
+    append_color_args(&mut encode_args, &meta.color, video_encoder);
+    if meta.has_audio {
+        encode_args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "192k".into(), "-af".into(), format!("atrim=duration={clip_duration:.6},asetpts=PTS-STARTPTS,aresample=async=1000:first_pts=0")]);
+    }
+    encode_args.push(output.to_string_lossy().into_owned());
+    let mut encoder = background_command(ffmpeg)
+        .args(&encode_args)
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            kill(&mut decoder);
+            format!("Could not start video encoder: {e}")
+        })?;
+    let mut reader = match decoder.stdout.take() {
+        Some(reader) => reader,
+        None => {
+            kill(&mut decoder);
+            kill(&mut encoder);
+            let _ = std::fs::remove_file(output);
+            return Err("Could not open decoder pipe".into());
+        }
+    };
+    let mut writer = match encoder.stdin.take() {
+        Some(writer) => writer,
+        None => {
+            kill(&mut decoder);
+            kill(&mut encoder);
+            let _ = std::fs::remove_file(output);
+            return Err("Could not open encoder pipe".into());
+        }
+    };
+    let frame_size = width as usize * height as usize * 3;
+    let mut bytes = vec![0_u8; frame_size];
+    let mut composited = Vec::with_capacity(frame_size);
+    let mut frame_count = 0_u64;
+    let mut ewma: Option<f64> = None;
+    let mut last_emit = Instant::now();
+    let mut performance = PerformanceMetrics {
+        decode_ms: 0.0,
+        preprocess_ms: 0.0,
+        inference_ms: 0.0,
+        postprocess_ms: 0.0,
+        temporal_and_composite_ms: 0.0,
+        encode_ms: 0.0,
+        first_inference_ms: None,
+    };
+    let mut result = Ok(());
+    for index in 0..total {
+        if control.cancelled.load(Ordering::SeqCst) {
+            result = Err("cancelled".into());
+            break;
+        }
+        let started = Instant::now();
+        let decode = Instant::now();
+        if let Err(error) = reader.read_exact(&mut bytes) {
+            if error.kind() != std::io::ErrorKind::UnexpectedEof {
+                result = Err(format!("Could not decode video frame: {error}"));
+            }
+            break;
+        }
+        performance.decode_ms += decode.elapsed().as_secs_f64() * 1000.0;
+        let frame =
+            match ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, std::mem::take(&mut bytes)) {
+                Some(frame) => frame,
+                None => {
+                    result = Err("Could not construct video frame".into());
+                    break;
+                }
+            };
+        let infer = Instant::now();
+        let mask = tracker.step(&frame, (index == 0).then_some(&seed), control);
+        let infer_ms = infer.elapsed().as_secs_f64() * 1000.0;
+        performance.inference_ms += infer_ms;
+        performance.first_inference_ms.get_or_insert(infer_ms);
+        let mask = match mask {
+            Ok(mask) => mask,
+            Err(error) => {
+                result = Err(error);
+                break;
+            }
+        };
+        let composite = Instant::now();
+        crate::temporal::composite_rgb_alpha(
+            frame.as_raw(),
+            mask.as_raw(),
+            screen_color,
+            &mut composited,
+        );
+        performance.temporal_and_composite_ms += composite.elapsed().as_secs_f64() * 1000.0;
+        let encode = Instant::now();
+        if let Err(error) = writer.write_all(&composited) {
+            result = Err(format!("Could not encode video frame: {error}"));
+            break;
+        }
+        performance.encode_ms += encode.elapsed().as_secs_f64() * 1000.0;
+        bytes = frame.into_raw();
+        frame_count += 1;
+        let seconds = started.elapsed().as_secs_f64();
+        ewma = Some(ewma.map(|old| old * 0.8 + seconds * 0.2).unwrap_or(seconds));
+        if let Some(app) = app
+            .filter(|_| frame_count == total || last_emit.elapsed() >= Duration::from_millis(200))
+        {
+            let eta = (frame_count >= 3 && total > frame_count)
+                .then(|| (ewma.unwrap_or(0.0) * (total - frame_count) as f64).ceil() as u64);
+            emit_progress(
+                app,
+                control,
+                "trackingFrames",
+                Some(frame_count),
+                Some(total.max(frame_count)),
+                eta,
+                format!("Tracking primary subject in frame {frame_count} of {total}"),
+            );
+            last_emit = Instant::now();
+        }
+    }
+    drop(writer);
+    if let Err(error) = result {
+        kill(&mut decoder);
+        kill(&mut encoder);
+        let _ = std::fs::remove_file(output);
+        return Err(error);
+    }
+    let decoder_status = decoder.wait().map_err(|e| e.to_string())?;
+    let encoder_status = encoder.wait().map_err(|e| e.to_string())?;
+    if !decoder_status.success() || !encoder_status.success() {
+        let details = [child_error(&mut decoder), child_error(&mut encoder)]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let _ = std::fs::remove_file(output);
+        return Err(if details.is_empty() {
+            "FFmpeg could not finish the tracked export".into()
+        } else {
+            details
+        });
+    }
+    if frame_count == 0 {
+        let _ = std::fs::remove_file(output);
+        return Err("Cutie did not receive a video frame".into());
+    }
+    let output_fps = parse_rate(&meta.fps_arg).unwrap_or(30.0);
+    validate_export(
+        ffprobe,
+        output,
+        width,
+        height,
+        clip_duration,
+        meta.has_audio,
+        output_fps,
+    )?;
+    let (tracker_width, tracker_height) = tracker.internal_size();
+    Ok(VideoOutcome {
+        frame_count,
+        provider: tracker.provider().into(),
+        precision: "FP32".into(),
+        pipeline: format!(
+            "Cutie primary-subject memory propagation at {tracker_width}x{tracker_height}"
+        ),
+        performance,
+        width,
+        height,
+        frame_rate: output_fps,
+        duration: clip_duration,
+        has_audio: meta.has_audio,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn process_video_with_cutie_paths(
+    control: &JobControl,
+    input: &Path,
+    output: &Path,
+    model_paths: &crate::cutie::CutieModelPaths,
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    quality: &str,
+    screen_color: &str,
+    seed_path: &Path,
+) -> Result<VideoOutcome, String> {
+    let mut tracker = crate::cutie::CutieTracker::load(model_paths, true)?;
+    tracker.reset();
+    process_video_with_cutie(
+        None,
+        control,
+        input,
+        output,
+        &mut tracker,
+        ffmpeg,
+        ffprobe,
+        quality,
+        screen_color,
+        seed_path,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -959,6 +1561,7 @@ fn process_video_with_masker(
     });
     let mut composited = Vec::with_capacity(frame_size);
     let mut frame_count = 0_u64;
+    let mut inferred_count = 0_u64;
     let mut ewma: Option<f64> = None;
     let mut stabilizer = TemporalMaskStabilizer::default();
     let mut last_progress_emit = Instant::now();
@@ -971,7 +1574,7 @@ fn process_video_with_masker(
         encode_ms: 0.0,
         first_inference_ms: None,
     };
-    let result = loop {
+    let mut result = loop {
         if control.cancelled.load(Ordering::SeqCst) {
             break Err("cancelled".into());
         }
@@ -982,7 +1585,7 @@ fn process_video_with_masker(
         };
         performance.decode_ms += decode.as_secs_f64() * 1000.0;
         let frame_started = Instant::now();
-        let mut cutout = match masker.apply_prepared(&prepared, edge_detail, control) {
+        let cutout = match masker.apply_prepared(&prepared, edge_detail, control) {
             Ok(cutout) => cutout,
             Err(error) => break Err(error),
         };
@@ -994,39 +1597,44 @@ fn process_video_with_masker(
             .first_inference_ms
             .get_or_insert(timing.inference.as_secs_f64() * 1000.0);
         let temporal_started = Instant::now();
-        if let Err(error) = stabilizer.apply_and_composite(
+        let temporal_result = stabilizer.push_frame(
             prepared.source_bytes(),
-            &mut cutout,
+            &cutout,
             screen_color,
             &mut composited,
-        ) {
-            break Err(error);
-        }
+        );
         performance.temporal_and_composite_ms += temporal_started.elapsed().as_secs_f64() * 1000.0;
         masker.recycle_cutout(cutout);
-        let encode_started = Instant::now();
-        if let Err(error) = writer.write_all(&composited) {
-            break Err(format!("Could not encode video frame: {error}"));
-        }
-        performance.encode_ms += encode_started.elapsed().as_secs_f64() * 1000.0;
         let _ = recycle_tx.send(prepared.into_recycling_parts());
-        frame_count += 1;
+        let output_ready = match temporal_result {
+            Ok(output_ready) => output_ready,
+            Err(error) => break Err(error),
+        };
+        if output_ready {
+            let encode_started = Instant::now();
+            if let Err(error) = writer.write_all(&composited) {
+                break Err(format!("Could not encode video frame: {error}"));
+            }
+            performance.encode_ms += encode_started.elapsed().as_secs_f64() * 1000.0;
+            frame_count += 1;
+        }
+        inferred_count += 1;
         let seconds = frame_started.elapsed().as_secs_f64();
         ewma = Some(ewma.map(|old| old * 0.8 + seconds * 0.2).unwrap_or(seconds));
-        let eta = (frame_count >= 3 && total > frame_count)
-            .then(|| (ewma.unwrap_or(0.0) * (total - frame_count) as f64).ceil() as u64);
+        let eta = (inferred_count >= 3 && total > inferred_count)
+            .then(|| (ewma.unwrap_or(0.0) * (total - inferred_count) as f64).ceil() as u64);
         if let Some(app) = app.filter(|_| {
-            frame_count == total || last_progress_emit.elapsed() >= Duration::from_millis(200)
+            inferred_count == total || last_progress_emit.elapsed() >= Duration::from_millis(200)
         }) {
             emit_progress(
                 app,
                 control,
                 "processingFrames",
-                Some(frame_count),
-                Some(total.max(frame_count)),
+                Some(inferred_count),
+                Some(total.max(inferred_count)),
                 eta,
                 format!(
-                    "Processing frame {frame_count} of {total} with {} and {}",
+                    "Processing frame {inferred_count} of {total} with {} and {}",
                     masker.provider().trim_end_matches("ExecutionProvider"),
                     video_encoder.label()
                 ),
@@ -1034,6 +1642,32 @@ fn process_video_with_masker(
             last_progress_emit = Instant::now();
         }
     };
+    if result.is_ok() && control.cancelled.load(Ordering::SeqCst) {
+        result = Err("cancelled".into());
+    }
+    if result.is_ok() {
+        let temporal_started = Instant::now();
+        let final_output = stabilizer.finish(screen_color, &mut composited);
+        performance.temporal_and_composite_ms += temporal_started.elapsed().as_secs_f64() * 1000.0;
+        match final_output {
+            Ok(true) => {
+                let encode_started = Instant::now();
+                if let Err(error) = writer.write_all(&composited) {
+                    result = Err(format!("Could not encode final video frame: {error}"));
+                } else {
+                    performance.encode_ms += encode_started.elapsed().as_secs_f64() * 1000.0;
+                    frame_count += 1;
+                }
+            }
+            Ok(false) => {}
+            Err(error) => result = Err(error),
+        }
+    }
+    if result.is_ok() && frame_count != inferred_count {
+        result = Err(format!(
+            "Temporal pipeline encoded {frame_count} of {inferred_count} inferred frames"
+        ));
+    }
     drop(recycle_tx);
     drop(writer);
     if let Err(error) = result {
@@ -1099,7 +1733,7 @@ fn process_video_with_masker(
         frame_count,
         provider: masker.provider().into(),
         precision: masker.precision().into(),
-        pipeline: "BiRefNet + 2-buffer temporal pipeline".into(),
+        pipeline: "BiRefNet + three-frame motion-gated temporal matte".into(),
         performance,
         width,
         height,
@@ -1249,5 +1883,62 @@ mod tests {
         };
         assert_eq!(color_spec(&stream, 1920, 1080).space, "bt709");
         assert_eq!(color_spec(&stream, 720, 480).filter_matrix, "bt601");
+    }
+
+    #[test]
+    fn transparent_imported_mask_uses_alpha_and_frame_rgb() {
+        let frame = ImageBuffer::from_pixel(16, 9, Rgb([12, 34, 56]));
+        let mask = image::RgbaImage::from_fn(32, 18, |x, _| {
+            image::Rgba([200, 10, 10, if x < 16 { 255 } else { 0 }])
+        });
+        let (cutout, kind) = prepare_imported_seed(&frame, DynamicImage::ImageRgba8(mask)).unwrap();
+
+        assert_eq!(kind, "alpha");
+        assert_eq!(cutout.dimensions(), frame.dimensions());
+        assert_eq!(&cutout.get_pixel(0, 0).0[..3], &[12, 34, 56]);
+        assert_eq!(cutout.get_pixel(0, 0)[3], 255);
+        assert_eq!(cutout.get_pixel(15, 0)[3], 0);
+    }
+
+    #[test]
+    fn opaque_imported_mask_uses_black_and_white_luminance() {
+        let frame = ImageBuffer::from_pixel(16, 9, Rgb([80, 90, 100]));
+        let mask = image::RgbImage::from_fn(16, 9, |x, _| {
+            if x < 8 {
+                Rgb([255, 255, 255])
+            } else {
+                Rgb([0, 0, 0])
+            }
+        });
+        let (cutout, kind) = prepare_imported_seed(&frame, DynamicImage::ImageRgb8(mask)).unwrap();
+
+        assert_eq!(kind, "luminance");
+        assert_eq!(cutout.get_pixel(0, 0)[3], 255);
+        assert_eq!(cutout.get_pixel(15, 0)[3], 0);
+    }
+
+    #[test]
+    fn imported_mask_rejects_wrong_aspect_ratio() {
+        let frame = ImageBuffer::from_pixel(16, 9, Rgb([0, 0, 0]));
+        let mask = DynamicImage::ImageRgba8(image::RgbaImage::new(16, 16));
+
+        assert!(prepare_imported_seed(&frame, mask)
+            .unwrap_err()
+            .contains("same aspect ratio"));
+    }
+
+    #[test]
+    fn imported_mask_requires_foreground_and_background() {
+        let frame = ImageBuffer::from_pixel(16, 9, Rgb([0, 0, 0]));
+        let all_subject =
+            DynamicImage::ImageRgb8(ImageBuffer::from_pixel(16, 9, Rgb([255, 255, 255])));
+        let no_subject = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(16, 9, Rgb([0, 0, 0])));
+
+        assert!(prepare_imported_seed(&frame, all_subject)
+            .unwrap_err()
+            .contains("leave some background"));
+        assert!(prepare_imported_seed(&frame, no_subject)
+            .unwrap_err()
+            .contains("does not contain a foreground"));
     }
 }
