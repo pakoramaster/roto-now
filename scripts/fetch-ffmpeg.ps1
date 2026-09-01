@@ -1,7 +1,8 @@
 $ErrorActionPreference = "Stop"
 
-$archiveUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-07-13-13/ffmpeg-n8.1.2-34-g9b6c8969e0-win64-gpl-8.1.zip"
-$archiveSha256 = "1555D35C6D6C747F152CB7C2F8B2E8CD5978A12AECD1E4863AD59438BCEF9492"
+# Use a repository-owned release asset because upstream rolling autobuild tags are pruned.
+$archiveUrl = "https://github.com/pakoramaster/roto-now/releases/download/dependencies-ffmpeg-8.1.2/ffmpeg-8.1.2-win64-gpl-roto-now.zip"
+$archiveSha256 = "79A018515F4CB1A29C2442FDB1DBAD0AFD9BCEB12FB11684581A30AC0EE1FB38"
 $binaryHashes = @{
     "ffmpeg.exe" = "FA142EBDE7643DF62FBF6B45161AD15111CA89A36B41373F058F73476E14F6D0"
     "ffprobe.exe" = "E7F564AE34449A95912EF92D13CEAB91820C93706EE23EA04BCC50F527D289B1"
@@ -10,7 +11,7 @@ $binaryHashes = @{
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $binaryRoot = Join-Path $projectRoot "src-tauri\bin"
 $downloadRoot = Join-Path $projectRoot ".toolchains\downloads"
-$archivePath = Join-Path $downloadRoot "ffmpeg-8.1.2-win64-gpl.zip"
+$archivePath = Join-Path $downloadRoot "ffmpeg-8.1.2-win64-gpl-roto-now.zip"
 $extractRoot = Join-Path $downloadRoot "ffmpeg-8.1.2-extracted"
 
 New-Item -ItemType Directory -Force -Path $binaryRoot, $downloadRoot | Out-Null
