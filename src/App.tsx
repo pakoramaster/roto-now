@@ -115,6 +115,11 @@ function App() {
   const [helpOpen, setHelpOpen] = useState(false);
   const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null);
 
+  useEffect(() => {
+    const url = media?.url;
+    return () => { if (url?.startsWith("blob:")) URL.revokeObjectURL(url); };
+  }, [media?.url]);
+
   const updatePlaybackRef = useCallback((seconds: number) => {
     playheadRef.current = seconds;
   }, []);
@@ -160,7 +165,7 @@ function App() {
       } else { setFullResult(payload.result); setCorrectionOpen(false); setCorrectionStrokes([]); }
       setPreviewMode("output");
       setStatus("done");
-    }).then((cleanup) => { unlisten = cleanup; });
+    }).then((cleanup) => { if (disposed) cleanup(); else unlisten = cleanup; }).catch((caught) => { if (!disposed) setError(String(caught)); });
     return () => { disposed = true; unlisten?.(); };
   }, []);
 
@@ -189,7 +194,6 @@ function App() {
   const acceptFile = (file?: File) => {
     if (!file) return;
     if (!isSupported(file)) { setError("Choose a supported image or video file."); return; }
-    if (media?.url.startsWith("blob:")) URL.revokeObjectURL(media.url);
     clearResults(); clearSeed();
     const kind: MediaKind = file.type.startsWith("video/") ? "video" : "image";
     setMedia({ file, name: file.name, size: file.size, kind, url: URL.createObjectURL(file) });
@@ -202,7 +206,6 @@ function App() {
       const selected = await openDialog({ multiple: false, directory: false, filters: [{ name: "Images and videos", extensions: ["png", "jpg", "jpeg", "webp", "mp4", "mov", "webm"] }] });
       if (!selected || Array.isArray(selected)) return;
       const info = await invoke<NativeMediaInfo>("inspect_media", { path: selected });
-      if (media?.url.startsWith("blob:")) URL.revokeObjectURL(media.url);
       clearResults(); clearSeed();
       setMedia({ path: info.path, name: info.name, size: info.size, kind: info.kind, url: info.previewDataUrl ?? convertFileSrc(info.path) });
       setError(null); setStatus("ready"); playheadRef.current = 0; setPlayhead(0);
@@ -210,7 +213,6 @@ function App() {
   };
 
   const reset = () => {
-    if (media?.url.startsWith("blob:")) URL.revokeObjectURL(media.url);
     clearResults(); clearSeed(); setMedia(null); setStatus("idle"); setError(null); playheadRef.current = 0; setPlayhead(0);
     if (inputRef.current) inputRef.current.value = "";
   };
@@ -336,7 +338,7 @@ function App() {
   }
 
   return <div className="app-shell">
-    <header className="topbar"><div className="brand"><span className="brand-mark"><Layers3 size={18} /></span><span>ROTO<span className="brand-accent">NOW</span></span><span className="beta-pill">BETA</span></div><nav className="top-actions" aria-label="Application"><button className={`icon-button ${showModels ? "active" : ""}`} aria-label="Manage models" aria-expanded={showModels} title="Manage models" onClick={() => setShowModels((value) => !value)}><Settings2 size={18} /></button><button className={`icon-button ${helpOpen ? "active" : ""}`} aria-label="Help and about" aria-expanded={helpOpen} title="Help and about" onClick={() => setHelpOpen(true)}><CircleHelp size={18} /></button></nav></header>
+    <header className="topbar"><div className="brand"><span>ROTO<span className="brand-accent">NOW</span></span></div><nav className="top-actions" aria-label="Application"><button className={`icon-button ${showModels ? "active" : ""}`} aria-label="Manage models" aria-expanded={showModels} title="Manage models" onClick={() => setShowModels((value) => !value)}><Settings2 size={18} /></button><button className={`icon-button ${helpOpen ? "active" : ""}`} aria-label="Help and about" aria-expanded={helpOpen} title="Help and about" onClick={() => setHelpOpen(true)}><CircleHelp size={18} /></button></nav></header>
     <main className="workspace">
       <input ref={inputRef} className="visually-hidden" type="file" accept="image/png,image/jpeg,image/webp,video/mp4,video/quicktime,video/webm" onChange={(event) => acceptFile(event.target.files?.[0])} />
       {showModels && <section className="model-manager panel" aria-labelledby="model-manager-title"><div className="model-manager-heading"><div><p>LOCAL MODELS</p><h2 id="model-manager-title">Model manager</h2><small>{bootstrap?.provider}</small></div><button className="icon-button" aria-label="Close model manager" onClick={() => setShowModels(false)}><X size={17} /></button></div><div className="model-list">{bootstrap?.models.map((item) => <div className="model-row" key={item.id}><div><strong>{item.name}</strong><small>{formatBytes(item.size)} · {item.provider} · {item.state === "local" ? "Local test model" : item.installed ? "Ready" : item.state === "partial" ? "Resume available" : "Not installed"}</small></div><span className={`model-state ${item.installed ? "ready" : ""}`}>{item.state === "local" ? "Local" : item.installed ? "Ready" : item.state === "partial" ? "Partial" : "Optional"}</span>{item.installed && item.managed ? <><button onClick={() => downloadModel(item.id)} disabled={!!activeJobId}><RotateCcw size={14} /> Redownload</button><button className="remove-model" aria-label={`Remove ${item.name}`} onClick={() => removeModel(item.id)} disabled={!!activeJobId}><Trash2 size={14} /></button></> : !item.installed ? <button onClick={() => downloadModel(item.id)} disabled={!!activeJobId}><Download size={14} /> {item.state === "partial" ? "Resume" : "Download"}</button> : <span className="local-model-note">Development</span>}</div>)}{bootstrap?.trackers.map((item) => <div className="model-row" key={item.id}><div><strong>{item.name}</strong><small>{formatBytes(item.size)} · {item.width}×{item.height} internal · {item.provider} · sequential tracking</small></div><span className={`model-state ${item.installed ? "ready" : ""}`}>{item.state === "local" ? "Local" : item.installed ? "Ready" : item.state === "partial" ? "Partial" : "Optional"}</span>{item.installed && item.managed ? <><button onClick={() => downloadCutie(item.tier)} disabled={!!activeJobId}><RotateCcw size={14} /> Redownload</button><button className="remove-model" aria-label={`Remove ${item.name}`} onClick={() => removeCutie(item.tier)} disabled={!!activeJobId}><Trash2 size={14} /></button></> : !item.installed ? <button onClick={() => downloadCutie(item.tier)} disabled={!!activeJobId || !isTauriRuntime()}><Download size={14} /> {item.state === "partial" ? "Resume" : "Download"}</button> : <span className="local-model-note">Development</span>}</div>)}</div>{activeJobId && progress && <><ProgressView progress={progress} /><button className="reset-button danger" onClick={cancelJob}>Cancel</button></>}</section>}
@@ -395,6 +397,17 @@ function VideoPlayer({ source, initialTime, onPlaybackTime, onTimeChange }: { so
     return () => document.removeEventListener("fullscreenchange", updateFullscreen);
   }, []);
 
+  useEffect(() => {
+    const video = videoRef.current;
+    if (video) { video.setAttribute("src", source); video.load(); }
+    return () => {
+      if (!video) return;
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+    };
+  }, [source]);
+
   const togglePlayback = () => {
     const video = videoRef.current;
     if (!video) return;
@@ -452,33 +465,56 @@ function CorrectionCanvas({ inputSource, outputSource, mode, radius, strokes, on
   const activeStroke = useRef<CorrectionStroke | null>(null);
   const baseStrokes = useRef<CorrectionStroke[]>([]);
 
+  const backingRef = useRef<{ output: HTMLImageElement; original: HTMLCanvasElement } | null>(null);
+  const [backingVersion, setBackingVersion] = useState(0);
+
   useEffect(() => {
     let disposed = false;
+    const images: HTMLImageElement[] = [];
+    const canvas = canvasRef.current;
     const load = (source: string) => new Promise<HTMLImageElement>((resolve, reject) => {
       const image = new Image();
+      images.push(image);
       image.onload = () => resolve(image);
       image.onerror = () => reject(new Error("Could not load correction preview"));
       image.src = source;
     });
     void Promise.all([load(inputSource), load(outputSource)]).then(([input, output]) => {
-      if (disposed || !canvasRef.current) return;
-      const canvas = canvasRef.current;
+      if (disposed || !canvas) return;
       canvas.width = output.naturalWidth;
       canvas.height = output.naturalHeight;
-      const context = canvas.getContext("2d");
-      if (!context) return;
-      context.clearRect(0, 0, canvas.width, canvas.height);
-      context.drawImage(output, 0, 0, canvas.width, canvas.height);
       const original = document.createElement("canvas");
       original.width = canvas.width;
       original.height = canvas.height;
       original.getContext("2d")?.drawImage(input, 0, 0, canvas.width, canvas.height);
-      const pattern = context.createPattern(original, "no-repeat");
-      if (!pattern) return;
-      for (const stroke of strokes) paintCorrectionStroke(context, pattern, stroke, canvas.width, canvas.height);
+      backingRef.current = { output, original };
+      setBackingVersion((current) => current + 1);
     }).catch(() => undefined);
-    return () => { disposed = true; };
-  }, [inputSource, outputSource, strokes]);
+    return () => {
+      disposed = true;
+      for (const image of images) {
+        image.onload = null;
+        image.onerror = null;
+        image.removeAttribute("src");
+      }
+      const backing = backingRef.current;
+      if (backing) { backing.original.width = 0; backing.original.height = 0; }
+      backingRef.current = null;
+      if (canvas) { canvas.width = 0; canvas.height = 0; }
+    };
+  }, [inputSource, outputSource]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const backing = backingRef.current;
+    const context = canvas?.getContext("2d");
+    if (!canvas || !backing || !context) return;
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(backing.output, 0, 0, canvas.width, canvas.height);
+    const pattern = context.createPattern(backing.original, "no-repeat");
+    if (!pattern) return;
+    for (const stroke of strokes) paintCorrectionStroke(context, pattern, stroke, canvas.width, canvas.height);
+  }, [backingVersion, strokes]);
 
   const pointFromEvent = (event: ReactPointerEvent<HTMLCanvasElement>): CorrectionPoint => {
     const bounds = event.currentTarget.getBoundingClientRect();

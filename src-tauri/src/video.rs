@@ -368,6 +368,11 @@ fn append_video_encoder_args(args: &mut Vec<String>, quality: QualityMode, encod
     }
 }
 
+pub(crate) fn validate_video_input(app: &AppHandle, source: &Path) -> Result<(), String> {
+    let ffprobe = bundled_binary(app, "ffprobe")?;
+    probe(&ffprobe, source).map(|_| ())
+}
+
 fn probe(ffprobe: &Path, source: &Path) -> Result<VideoMeta, String> {
     let output = background_command(ffprobe)
         .args([
@@ -403,6 +408,7 @@ fn probe(ffprobe: &Path, source: &Path) -> Result<VideoMeta, String> {
         .ok_or("The file has no video stream")?;
     let coded_width = video.width.ok_or("Video width is unavailable")?;
     let coded_height = video.height.ok_or("Video height is unavailable")?;
+    crate::media_limits::video_frame_bytes(coded_width, coded_height)?;
     let rotation = normalized_rotation(video);
     let (width, height) = normalized_dimensions(
         coded_width,
@@ -410,6 +416,7 @@ fn probe(ffprobe: &Path, source: &Path) -> Result<VideoMeta, String> {
         parse_aspect_ratio(video.sample_aspect_ratio.as_deref()),
         rotation,
     );
+    crate::media_limits::video_frame_bytes(width, height)?;
     let color = color_spec(video, width, height);
     let (fps_arg, fps) = select_frame_rate(
         video.avg_frame_rate.as_deref(),
@@ -455,17 +462,91 @@ fn preview_dimensions(width: u32, height: u32) -> (u32, u32) {
     (even(width as f64 * scale), even(height as f64 * scale))
 }
 
-fn kill(child: &mut Child) {
-    let _ = child.kill();
+const STDERR_TAIL_BYTES: usize = 64 * 1024;
+
+fn drain_stderr(mut reader: impl Read) -> Vec<u8> {
+    let mut tail = VecDeque::with_capacity(STDERR_TAIL_BYTES);
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                let excess = (tail.len() + count).saturating_sub(STDERR_TAIL_BYTES);
+                tail.drain(..excess);
+                tail.extend(&buffer[..count]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    tail.into_iter().collect()
+}
+
+// Own both the process and its stderr worker so every early return reaps them.
+struct FfmpegChild {
+    child: Child,
+    stderr_worker: Option<thread::JoinHandle<Vec<u8>>>,
+    stderr_tail: Vec<u8>,
+}
+
+impl FfmpegChild {
+    fn new(mut child: Child) -> Self {
+        let stderr_worker = child
+            .stderr
+            .take()
+            .map(|stderr| thread::spawn(move || drain_stderr(stderr)));
+        Self {
+            child,
+            stderr_worker,
+            stderr_tail: Vec::new(),
+        }
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait()?;
+        self.join_stderr();
+        Ok(status)
+    }
+
+    fn join_stderr(&mut self) {
+        if let Some(worker) = self.stderr_worker.take() {
+            self.stderr_tail = worker.join().unwrap_or_default();
+        }
+    }
+}
+
+impl std::ops::Deref for FfmpegChild {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for FfmpegChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+
+impl Drop for FfmpegChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.join_stderr();
+    }
+}
+
+fn kill(child: &mut FfmpegChild) {
+    let _ = child.child.kill();
     let _ = child.wait();
 }
 
-fn child_error(child: &mut Child) -> String {
-    let mut message = String::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        let _ = stderr.read_to_string(&mut message);
-    }
-    message.trim().chars().take(1200).collect()
+fn child_error(child: &mut FfmpegChild) -> String {
+    String::from_utf8_lossy(&child.stderr_tail)
+        .trim()
+        .chars()
+        .take(1200)
+        .collect()
 }
 
 fn validate_export(
@@ -658,7 +739,7 @@ pub fn create_video_seed(
             None,
             "Preparing the attached first-frame mask",
         );
-        let supplied = image::open(mask_path)
+        let supplied = crate::media_limits::open_image(mask_path)
             .map_err(|error| format!("Could not open the attached PNG mask: {error}"))?;
         let (cutout, mask_kind) = prepare_imported_seed(&frame, supplied)?;
         cutout
@@ -874,7 +955,7 @@ fn process_video_with_cutie(
     let quality_mode = QualityMode::parse(quality)?;
     let meta = probe(ffprobe, input)?;
     let (width, height, total) = (meta.width, meta.height, meta.frames);
-    let seed_image = image::open(seed_path)
+    let seed_image = crate::media_limits::open_image(seed_path)
         .map_err(|error| format!("Could not open first-frame mask: {error}"))?;
     let rgba = seed_image.to_rgba8();
     let has_alpha = rgba.pixels().any(|pixel| pixel[3] < 255);
@@ -933,6 +1014,7 @@ fn process_video_with_cutie(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
+        .map(FfmpegChild::new)
         .map_err(|e| format!("Could not start video decoder: {e}"))?;
     let clip_duration = meta.duration;
     let mut encode_args = vec![
@@ -987,6 +1069,7 @@ fn process_video_with_cutie(
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
+        .map(FfmpegChild::new)
         .map_err(|e| {
             kill(&mut decoder);
             format!("Could not start video encoder: {e}")
@@ -1009,7 +1092,7 @@ fn process_video_with_cutie(
             return Err("Could not open encoder pipe".into());
         }
     };
-    let frame_size = width as usize * height as usize * 3;
+    let frame_size = crate::media_limits::video_frame_bytes(width, height)?;
     let mut bytes = vec![0_u8; frame_size];
     let mut composited = Vec::with_capacity(frame_size);
     let mut frame_count = 0_u64;
@@ -1426,6 +1509,7 @@ fn process_video_with_masker(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
+        .map(FfmpegChild::new)
         .map_err(|error| format!("Could not start video decoder: {error}"))?;
 
     let mut encode_args = vec![
@@ -1486,6 +1570,7 @@ fn process_video_with_masker(
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
+        .map(FfmpegChild::new)
         .map_err(|error| {
             kill(&mut decoder);
             format!("Could not start video encoder: {error}")
@@ -1509,7 +1594,7 @@ fn process_video_with_masker(
             return Err("Could not open encoder pipe".into());
         }
     };
-    let frame_size = width as usize * height as usize * 3;
+    let frame_size = crate::media_limits::video_frame_bytes(width, height)?;
     let (prepared_tx, prepared_rx) =
         mpsc::sync_channel::<Result<(PreparedFrame, Duration), String>>(2);
     let (recycle_tx, recycle_rx) = mpsc::sync_channel::<(Vec<u8>, Vec<f32>)>(2);
@@ -1746,6 +1831,61 @@ fn process_video_with_masker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stderr_drain_keeps_only_the_bounded_tail() {
+        let mut bytes = vec![b'x'; STDERR_TAIL_BYTES * 4];
+        bytes.extend_from_slice(b"last diagnostic");
+        let tail = drain_stderr(std::io::Cursor::new(&bytes));
+        assert_eq!(tail.len(), STDERR_TAIL_BYTES);
+        assert_eq!(tail, bytes[bytes.len() - STDERR_TAIL_BYTES..]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn noisy_child_finishes_with_bounded_diagnostics() {
+        let child = background_command(Path::new("powershell.exe"))
+            .args([
+                "-NoProfile",
+                "-Command",
+                "[Console]::Error.Write(('x' * 262144) + 'END')",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child = FfmpegChild::new(child);
+        assert!(child.wait().unwrap().success());
+        assert_eq!(child.stderr_tail.len(), STDERR_TAIL_BYTES);
+        assert!(child.stderr_tail.ends_with(b"END"));
+        assert!(child.stderr_worker.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn early_return_reaps_child_and_joins_stderr() {
+        let child = background_command(Path::new("powershell.exe"))
+            .args([
+                "-NoProfile",
+                "-Command",
+                "[Console]::Error.Write('started'); Start-Sleep -Seconds 60",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        drop(FfmpegChild::new(child));
+        let status = background_command(Path::new("powershell.exe"))
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 1 }}"),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "child survived ownership cleanup");
+    }
 
     #[test]
     fn preview_size_is_even_and_bounded() {

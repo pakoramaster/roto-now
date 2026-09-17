@@ -232,10 +232,17 @@ impl Masker {
             != Some(std::ffi::OsStr::new("1")))
         .then(|| crate::models::accelerated_model_path(&path, model_id))
         .flatten();
-        if prefer_directml {
+        // FP32 General Lite can exhaust shared GPU memory. Use the CPU
+        // fallback when its low-memory companion is unavailable.
+        if prefer_directml && (model_id != ModelId::GeneralLite || accelerated_path.is_some()) {
             let dml_path = accelerated_path.as_ref().unwrap_or(&path);
             let directml = (|| {
-                let builder = Session::builder().map_err(|error| error.to_string())?;
+                let builder = Session::builder()
+                    .map_err(|error| error.to_string())?
+                    .with_execution_providers([ep::CPU::default()
+                        .with_arena_allocator(false)
+                        .build()])
+                    .map_err(|error| error.to_string())?;
                 let builder = builder
                     .with_parallel_execution(false)
                     .map_err(|error| error.to_string())?;
@@ -270,7 +277,10 @@ impl Masker {
         }
 
         let session = (|| {
-            let builder = Session::builder().map_err(|error| error.to_string())?;
+            let builder = Session::builder()
+                .map_err(|error| error.to_string())?
+                .with_execution_providers([ep::CPU::default().with_arena_allocator(false).build()])
+                .map_err(|error| error.to_string())?;
             let builder = builder
                 .with_parallel_execution(false)
                 .map_err(|error| error.to_string())?;
@@ -330,6 +340,9 @@ impl Masker {
         quality: &str,
         control: &JobControl,
     ) -> Result<DynamicImage, String> {
+        // Smoke harnesses and native callers share the same decoded-pixel bound.
+        let (width, height) = (source.width(), source.height());
+        crate::media_limits::validate_source_image_dimensions(width, height)?;
         let mut prepared = prepare_rgb_frame(
             source.to_rgb8(),
             self.model_id,
@@ -371,7 +384,12 @@ impl Masker {
                 // requires recreating the device in that case.
                 self.session.take();
                 let directml_retry: Result<(Session, Vec<f32>), String> = (|| {
-                    let builder = Session::builder().map_err(|error| error.to_string())?;
+                    let builder = Session::builder()
+                        .map_err(|error| error.to_string())?
+                        .with_execution_providers([ep::CPU::default()
+                            .with_arena_allocator(false)
+                            .build()])
+                        .map_err(|error| error.to_string())?;
                     let builder = builder
                         .with_parallel_execution(false)
                         .map_err(|error| error.to_string())?;
@@ -401,7 +419,12 @@ impl Masker {
                     eprintln!(
                         "DirectML inference failed and device recreation did not recover it; switching to CPU: {error}; retry: {retry_error}"
                     );
-                    let builder = Session::builder().map_err(|error| error.to_string())?;
+                    let builder = Session::builder()
+                        .map_err(|error| error.to_string())?
+                        .with_execution_providers([ep::CPU::default()
+                            .with_arena_allocator(false)
+                            .build()])
+                        .map_err(|error| error.to_string())?;
                     let builder = builder
                         .with_parallel_execution(false)
                         .map_err(|error| error.to_string())?;
