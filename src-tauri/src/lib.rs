@@ -3,12 +3,12 @@ pub mod cutie;
 pub mod cutie_models;
 pub mod inference;
 pub mod jobs;
+mod media_limits;
 pub mod models;
 pub mod routing;
 pub mod temporal;
 pub mod video;
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use inference::{save_cutout, ModelSessionCache};
 use jobs::{emit, emit_progress, JobEvent, JobState, ProcessResult};
 use models::ModelId;
@@ -42,6 +42,7 @@ struct MediaInfo {
     name: String,
     size: u64,
     kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
     preview_data_url: Option<String>,
 }
 
@@ -75,11 +76,6 @@ fn extension_kind(path: &Path) -> Option<(&'static str, &'static str)> {
         "webm" => Some(("video", "video/webm")),
         _ => None,
     }
-}
-
-fn image_data_url(path: &Path, mime: &str) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|error| format!("Could not read image: {error}"))?;
-    Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
 }
 
 fn managed_temp_root() -> PathBuf {
@@ -168,7 +164,7 @@ fn inspect_media(app: AppHandle, path: String) -> Result<MediaInfo, String> {
     if !metadata.is_file() {
         return Err("The selected path is not a file".into());
     }
-    let (kind, mime) =
+    let (kind, _mime) =
         extension_kind(&source).ok_or("Choose a PNG, JPG, WEBP, MP4, MOV, or WEBM file")?;
     let maximum = if kind == "image" {
         MAX_IMAGE_BYTES
@@ -185,9 +181,12 @@ fn inspect_media(app: AppHandle, path: String) -> Result<MediaInfo, String> {
             "The selected {kind} is too large (maximum {limit})"
         ));
     }
-    let preview_data_url = (kind == "image")
-        .then(|| image_data_url(&source, mime))
-        .transpose()?;
+    if kind == "image" {
+        media_limits::inspect_image(&source)?;
+    } else {
+        video::validate_video_input(&app, &source)?;
+    }
+    let preview_data_url = None;
     Ok(MediaInfo {
         path,
         name: source
@@ -229,8 +228,11 @@ fn start_image_job(
     tauri::async_runtime::spawn_blocking(move || {
         let started = Instant::now();
         let outcome = (|| {
-            let source =
-                image::open(&input).map_err(|error| format!("Could not open image: {error}"))?;
+            app_for_task
+                .state::<cutie::CutieSessionCache>()
+                .invalidate();
+            let source = media_limits::open_image(&input)
+                .map_err(|error| format!("Could not open image: {error}"))?;
             app_for_task.state::<ModelSessionCache>().with_model(
                 model_path,
                 model_id,
@@ -675,7 +677,7 @@ fn apply_image_corrections(
         return Err("Only a managed PNG result can be corrected".into());
     }
 
-    let mut image = image::open(&source)
+    let mut image = media_limits::open_image(&source)
         .map_err(|error| format!("Could not open the cutout for correction: {error}"))?
         .to_rgba8();
     corrections::apply_corrections(&mut image, &strokes)?;
@@ -700,7 +702,7 @@ fn apply_video_seed_corrections(
     {
         return Err("Only a managed first-frame mask can be corrected".into());
     }
-    let mut image = image::open(&source)
+    let mut image = media_limits::open_image(&source)
         .map_err(|error| format!("Could not open the first-frame mask: {error}"))?
         .to_rgba8();
     corrections::apply_corrections(&mut image, &strokes)?;

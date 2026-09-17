@@ -583,11 +583,14 @@ impl CutieSessionCache {
             .as_ref()
             .is_some_and(|(cached, _)| cached.encode_key == paths.encode_key && cached.all_exist());
         if !reused {
+            *active = None;
             *active = Some((paths.clone(), CutieTracker::load(&paths, true)?));
         }
         let (_, tracker) = active.as_mut().ok_or("Cutie cache was not initialized")?;
         tracker.reset();
-        operation(tracker, reused)
+        let result = operation(tracker, reused);
+        tracker.reset();
+        result
     }
     pub fn invalidate(&self) {
         *self.active.lock() = None;
@@ -597,6 +600,83 @@ impl CutieSessionCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires installed Cutie models and real media; set ROTO_NOW_MEMORY_TEST_ROOT"]
+    fn installed_cache_releases_history_and_handles_tier_load_failure() {
+        let root =
+            PathBuf::from(std::env::var_os("ROTO_NOW_MEMORY_TEST_ROOT").expect("fixture root"));
+        let paths = |tier: &str, width, height| {
+            let dir = root.join(".models").join(tier);
+            let size = format!("{width}x{height}");
+            CutieModelPaths {
+                encode_key: dir.join(format!("cutie-encode-key-{size}.onnx")),
+                encode_value: dir.join(format!("cutie-encode-value-{size}.onnx")),
+                memory_readout: dir.join(format!(
+                    "cutie-memory-readout-floatmask-valid-{size}-m6-topk30-opencv.onnx"
+                )),
+                decode: dir.join(format!("cutie-decode-{size}.onnx")),
+                width,
+                height,
+            }
+        };
+        let balanced = paths("cutie-medium", 640, 368);
+        let high = paths("cutie-high", 960, 544);
+        let frame = image::open(root.join(".runtime-test/cutie-first-frame.png"))
+            .unwrap()
+            .to_rgb8();
+        let seed = image::open(root.join(".runtime-test/cutie-seed.png"))
+            .unwrap()
+            .to_rgba8();
+        let seed = image::GrayImage::from_fn(seed.width(), seed.height(), |x, y| {
+            image::Luma([seed.get_pixel(x, y)[3]])
+        });
+        let control = crate::jobs::JobState::default().begin().unwrap();
+        let cache = CutieSessionCache::default();
+        for (index, model_paths) in [
+            balanced.clone(),
+            balanced.clone(),
+            balanced.clone(),
+            high.clone(),
+            high,
+            balanced,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let result: Result<(), String> = cache.with_tracker(model_paths, |tracker, reused| {
+                assert_eq!(reused, matches!(index, 1 | 2 | 4));
+                tracker.step(&frame, Some(&seed), &control)?;
+                assert!(tracker.permanent_memory.is_some());
+                println!(
+                    "cache iteration={index} reused={reused} provider={}",
+                    tracker.provider()
+                );
+                if index == 1 {
+                    return Err("simulated processing failure".into());
+                }
+                if index == 2 {
+                    return Err("cancelled".into());
+                }
+                Ok(())
+            });
+            if matches!(index, 1 | 2) {
+                assert!(result.is_err());
+            } else {
+                result.unwrap();
+            }
+            let active = cache.active.lock();
+            let tracker = &active.as_ref().unwrap().1;
+            assert!(tracker.permanent_memory.is_none());
+            assert!(tracker.working_memory.is_empty());
+            assert!(tracker.last_mask.is_empty());
+            assert!(tracker.object_memory.is_empty());
+            assert_eq!(tracker.frame_index, 0);
+        }
+        let missing = paths("missing-tier", 960, 544);
+        assert!(cache.with_tracker(missing, |_, _| Ok(())).is_err());
+        assert!(cache.active.lock().is_none());
+    }
+
     #[test]
     fn letterbox_preserves_widescreen_geometry() {
         let value = letterbox(1920, 1080, 640, 368);
