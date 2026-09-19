@@ -1,14 +1,12 @@
 <div align="center">
-  <img src="src-tauri/icons/128x128.png" width="96" alt="Roto Now icon">
+  <img src="src/assets/roto-now-logo.png" width="96" alt="Roto Now logo">
 
   # Roto Now
 
   Remove image and video backgrounds locally on Windows.
 
-  No account, no uploads, and no separate Python or FFmpeg setup.
+  The installed app needs no account, makes no uploads, and requires no separate Python or FFmpeg setup.
 </div>
-
-> **Beta:** The main image and video workflows are usable. Video offers the existing motion-aware temporal mode and optional Cutie primary-subject tracking. See [Current limitations](#current-limitations) before production work.
 
 ---
 
@@ -29,7 +27,7 @@
 - Seed Cutie from a General or Anime first-frame mask, or attach your own PNG subject mask, then refine it with Add Subject and Remove brushes.
 - Export an H.264 MP4 with a green or blue background.
 - Keep the source audio, orientation, aspect ratio, and practical playback timing.
-- Smooth masks between nearby frames and guard against brief full-screen colour flashes.
+- In Temporal mode, smooth masks between nearby frames and guard against brief full-screen colour flashes.
 
 Everything is processed on your computer. The only optional network activity is downloading AI models from the in-app model manager.
 
@@ -49,13 +47,25 @@ Windows may show a SmartScreen warning while beta installers are unsigned. Check
 
 1. Open Roto Now and choose **Browse files**.
 2. Pick **General** for people, animals, products, and photos, or **Anime** for illustrations and line art.
-3. Choose a quality mode. **Balanced** is the best starting point for most work.
+3. For images, choose a quality mode. **Balanced** is the best starting point for most work.
 4. For video, move the playhead and use **Preview frame** to check the selected detection model and screen colour.
 5. Keep **Temporal** and select General Lite, General Maximum, or Anime for per-frame segmentation; or select **Primary Subject**, choose a model to generate the frame-0 mask (or attach your own PNG), remove unwanted furniture/background from it, and confirm the mask.
 6. Select **Remove background**, **Process full video**, or **Track primary subject**.
 7. Compare **Input** and **Output**, make brush corrections to images if needed, then save the result.
 
 Your original file is never overwritten. Roto Now creates a temporary result first and only opens a Save dialog after processing succeeds.
+
+## Models
+
+| In-app name | Underlying model or package | Availability | Used for |
+| --- | --- | --- | --- |
+| **General Lite** | BiRefNet General BB-Swin Tiny, epoch 232 (`BiRefNet-general-bb_swin_v1_tiny-epoch_232`) | Included with the app | Fast and Balanced images, fast Temporal video, and first-frame masks |
+| **General Maximum** | BiRefNet General, epoch 244 (`BiRefNet-general-epoch_244`) | Optional download | Maximum-quality images, detailed Temporal video, and first-frame masks |
+| **Anime / Anime ToonOut** | BiRefNet ToonOut FP16 (`birefnet-toonout-fp16`) | Optional download | Animation, illustrations, line art, and stylized first-frame masks |
+| **Cutie Balanced** | OpenShot ONNX Cutie Medium (`cutie-opencv-medium-640x368`, four-network package) | Optional download | Sequential Primary Subject tracking at 640×368 |
+| **Cutie High Detail** | OpenShot ONNX Cutie High (`cutie-opencv-high-960x544`, four-network package) | Optional download | Sequential Primary Subject tracking at 960×544 |
+
+General Lite, General Maximum, and Anime ToonOut are segmentation models. Cutie Balanced and Cutie High Detail are tracking models that use an editable first-frame segmentation mask.
 
 ## Choosing settings
 
@@ -89,7 +99,7 @@ Video model selection is explicit: Temporal uses the selected model for every fr
 
 ## Current limitations
 
-- Windows is the supported desktop platform during beta.
+- Windows is the supported desktop platform.
 - Temporal mode still infers each frame independently before a three-frame, motion-gated temporal matte stage; it does not perform object tracking.
 - Cutie tracks the marked primary subject sequentially, but it can drift after long occlusions, abrupt cuts, or when the frame-0 mask contains other objects. It does not automatically re-seed at scene cuts.
 - Fast motion, motion blur, transparent objects, fine flyaway hair, and low subject/background contrast can still produce unstable edges.
@@ -105,16 +115,18 @@ Video model selection is explicit: Temporal uses the selected model for every fr
 - Node.js
 - Rust
 - Visual Studio Build Tools with **Desktop development with C++** and a Windows SDK
-- Python only when regenerating the packaged FP16 General Lite model
+- Python when the ignored FP16 General Lite bundle model needs to be generated
 
-From the repository root in PowerShell:
+From a clean checkout, create the project-local Python environment and install the model-conversion dependencies before the first development launch:
 
 ```powershell
 npm install
+python -m venv .python-env
+& ".\.python-env\Scripts\python.exe" -m pip install -r scripts\requirements-model-conversion.txt
 .\scripts\tauri-dev.ps1
 ```
 
-The development script downloads and verifies the pinned FFmpeg build and configures the project-local Rust environment. It also exposes ignored reference models under `.models/` when they are available:
+The development script downloads and verifies the pinned FFmpeg and General Lite assets, generates the FP16 General Lite model when needed, and configures the project-local Rust environment. It also exposes ignored reference models under `.models/` when they are available:
 
 ```text
 .models/rembg/birefnet-general-lite.onnx
@@ -163,6 +175,7 @@ Processing changes should also be checked manually with a general photo, an anim
 Fetch the pinned bundle assets and build the Windows NSIS installer:
 
 ```powershell
+python -m venv .python-env
 & ".\.python-env\Scripts\python.exe" -m pip install -r scripts\requirements-model-conversion.txt
 .\scripts\fetch-ffmpeg.ps1
 .\scripts\fetch-general-lite.ps1
@@ -171,12 +184,12 @@ npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis
 
 Large model weights, FFmpeg executables, virtual environments, local toolchains, and generated build output are intentionally excluded from Git.
 
-### Local installer with every model
+### Local installer with every segmentation model
 
-If the ignored `.models` directory contains General Maximum and Anime, build a local NSIS installer that includes every model:
+If the ignored `.models` directory contains General Maximum and Anime, build a local NSIS installer that includes every segmentation model:
 
 ```powershell
 npm.cmd run tauri:build:all-models
 ```
 
-This verifies and packages General Lite FP32/FP16, General Maximum, and Anime. On first launch, Roto Now copies the bundled models into its per-user app-data folder, so the model manager shows them as ready without downloading anything. The all-model installer is much larger than the normal release installer and is intended for local or offline use.
+This verifies and packages General Lite FP32/FP16, General Maximum, and Anime. Cutie Balanced and High Detail remain separate optional downloads. On first launch, Roto Now copies the bundled segmentation models into its per-user app-data folder, so the model manager shows them as ready without downloading them. This installer is much larger than the normal release installer and is intended for local or offline use.

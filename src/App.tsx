@@ -3,7 +3,8 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { ArrowRight, Brush, Check, ChevronDown, CircleHelp, Download, Eraser, FileImage, Film, FolderOpen, Image as ImageIcon, Layers3, Maximize2, Minimize2, Pause, Play, RotateCcw, Settings2, Trash2, Undo2, UploadCloud, Volume2, VolumeX, WandSparkles, X, Zap } from "lucide-react";
+import { ArrowRight, Brush, Check, ChevronDown, CircleHelp, Download, Eraser, FileImage, Film, FolderOpen, Image as ImageIcon, Maximize2, Minimize2, Pause, Play, RotateCcw, Settings2, Trash2, Undo2, UploadCloud, Volume2, VolumeX, WandSparkles, X, Zap } from "lucide-react";
+import rotoNowLogo from "./assets/roto-now-logo.png";
 
 type MediaKind = "image" | "video";
 type Quality = "Fast" | "Balanced" | "Maximum";
@@ -120,6 +121,17 @@ function App() {
     const url = media?.url;
     return () => { if (url?.startsWith("blob:")) URL.revokeObjectURL(url); };
   }, [media?.url]);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    const preventContextMenu = (event: MouseEvent) => event.preventDefault();
+    document.documentElement.classList.add("native-runtime");
+    document.addEventListener("contextmenu", preventContextMenu);
+    return () => {
+      document.removeEventListener("contextmenu", preventContextMenu);
+      document.documentElement.classList.remove("native-runtime");
+    };
+  }, []);
 
   const updatePlaybackRef = useCallback((seconds: number) => {
     playheadRef.current = seconds;
@@ -366,11 +378,11 @@ function App() {
 
   if (bootstrap && !bootstrap.ready) {
     const lite = bootstrap.models.find((item) => item.id === "generalLite");
-    return <div className="app-shell onboarding"><div className="onboarding-card"><span className="brand-mark"><Layers3 size={24} /></span><p>WELCOME TO ROTO NOW</p><h1>One local model,<br /><span>then you are ready.</span></h1><p className="intro-copy">General Lite is required for general images and frame previews. It stays in your app-data folder and your media never leaves this computer.</p><div className="model-download-summary"><strong>{lite?.name ?? "General Lite"}</strong><span>{lite ? formatBytes(lite.size) : "Required model"}</span></div>{progress && <ProgressView progress={progress} />}<button className="process-button" disabled={!!activeJobId} onClick={() => downloadModel("generalLite")}><Download size={18} />{activeJobId ? "Downloading…" : "Download General Lite"}</button>{activeJobId && <button className="reset-button danger" onClick={cancelJob}>Cancel download</button>}{error && <p className="onboarding-error">Offline or download failed: {error}</p>}{error && !activeJobId && <button className="reset-button" onClick={() => downloadModel("generalLite")}>Retry</button>}</div></div>;
+    return <div className="app-shell onboarding"><div className="onboarding-card"><img className="onboarding-logo" src={rotoNowLogo} alt="Roto Now" /><p>WELCOME TO ROTO NOW</p><h1>One local model,<br /><span>then you are ready.</span></h1><p className="intro-copy">General Lite is required for general images and frame previews. It stays in your app-data folder and your media never leaves this computer.</p><div className="model-download-summary"><strong>{lite?.name ?? "General Lite"}</strong><span>{lite ? formatBytes(lite.size) : "Required model"}</span></div>{progress && <ProgressView progress={progress} />}<button className="process-button" disabled={!!activeJobId} onClick={() => downloadModel("generalLite")}><Download size={18} />{activeJobId ? "Downloading…" : "Download General Lite"}</button>{activeJobId && <button className="reset-button danger" onClick={cancelJob}>Cancel download</button>}{error && <p className="onboarding-error">Offline or download failed: {error}</p>}{error && !activeJobId && <button className="reset-button" onClick={() => downloadModel("generalLite")}>Retry</button>}</div></div>;
   }
 
   return <div className="app-shell">
-    <header className="topbar"><div className="brand"><span>ROTO<span className="brand-accent">NOW</span></span></div><nav className="top-actions" aria-label="Application"><button className={`icon-button ${showModels ? "active" : ""}`} aria-label="Manage models" aria-expanded={showModels} title="Manage models" onClick={() => setShowModels((value) => !value)}><Settings2 size={18} /></button><button className={`icon-button ${helpOpen ? "active" : ""}`} aria-label="Help and about" aria-expanded={helpOpen} title="Help and about" onClick={() => setHelpOpen(true)}><CircleHelp size={18} /></button></nav></header>
+    <header className="topbar"><div className="brand"><img className="brand-logo" src={rotoNowLogo} alt="" /><span>ROTO<span className="brand-accent">NOW</span></span></div><nav className="top-actions" aria-label="Application"><button className={`icon-button ${showModels ? "active" : ""}`} aria-label="Manage models" aria-expanded={showModels} title="Manage models" onClick={() => setShowModels((value) => !value)}><Settings2 size={18} /></button><button className={`icon-button ${helpOpen ? "active" : ""}`} aria-label="Help and about" aria-expanded={helpOpen} title="Help and about" onClick={() => setHelpOpen(true)}><CircleHelp size={18} /></button></nav></header>
     <main className="workspace">
       <input ref={inputRef} className="visually-hidden" type="file" accept="image/png,image/jpeg,image/webp,video/mp4,video/quicktime,video/webm" onChange={(event) => acceptFile(event.target.files?.[0])} />
       {showModels && <div className="modal-backdrop" role="presentation" onPointerDown={(event) => { if (event.target === event.currentTarget) setShowModels(false); }}><section className="model-manager panel" role="dialog" aria-modal="true" aria-labelledby="model-manager-title"><div className="model-manager-heading"><div><p>LOCAL MODELS</p><h2 id="model-manager-title">Model manager</h2><small>{bootstrap?.provider}</small></div><button className="icon-button" aria-label="Close model manager" autoFocus onClick={() => setShowModels(false)}><X size={17} /></button></div><div className="model-list">{bootstrap?.models.map((item) => <div className="model-row" key={item.id}><div><strong>{item.name}</strong><small>{formatBytes(item.size)} · {item.provider}</small></div><span className={`model-state ${item.installed ? "ready" : ""}`}>{item.state === "local" ? "Local" : item.installed ? "Ready" : item.state === "partial" ? "Partial" : "Optional"}</span>{item.installed && item.managed ? <><button onClick={() => downloadModel(item.id)} disabled={!!activeJobId}><RotateCcw size={14} /> Redownload</button><button className="remove-model" aria-label={`Remove ${item.name}`} onClick={() => removeModel(item.id)} disabled={!!activeJobId}><Trash2 size={14} /></button></> : !item.installed ? <button onClick={() => downloadModel(item.id)} disabled={!!activeJobId}><Download size={14} /> {item.state === "partial" ? "Resume" : "Download"}</button> : <span className="local-model-note">Development</span>}</div>)}{bootstrap?.trackers.map((item) => <div className="model-row" key={item.id}><div><strong>{item.name}</strong><small>{formatBytes(item.size)} · {item.width}×{item.height} internal · {item.provider} · sequential tracking</small></div><span className={`model-state ${item.installed ? "ready" : ""}`}>{item.state === "local" ? "Local" : item.installed ? "Ready" : item.state === "partial" ? "Partial" : "Optional"}</span>{item.installed && item.managed ? <><button onClick={() => downloadCutie(item.tier)} disabled={!!activeJobId}><RotateCcw size={14} /> Redownload</button><button className="remove-model" aria-label={`Remove ${item.name}`} onClick={() => removeCutie(item.tier)} disabled={!!activeJobId}><Trash2 size={14} /></button></> : !item.installed ? <button onClick={() => downloadCutie(item.tier)} disabled={!!activeJobId || !isTauriRuntime()}><Download size={14} /> {item.state === "partial" ? "Resume" : "Download"}</button> : <span className="local-model-note">Development</span>}</div>)}</div>{activeJobId && progress && <><ProgressView progress={progress} /><button className="reset-button danger" onClick={cancelJob}>Cancel</button></>}</section></div>}
