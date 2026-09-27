@@ -12,6 +12,7 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $binaryRoot = Join-Path $projectRoot "src-tauri\bin"
 $downloadRoot = Join-Path $projectRoot ".toolchains\downloads"
 $archivePath = Join-Path $downloadRoot "ffmpeg-8.1.2-win64-gpl-roto-now.zip"
+$partialArchivePath = "$archivePath.part"
 $extractRoot = Join-Path $downloadRoot "ffmpeg-8.1.2-extracted"
 
 New-Item -ItemType Directory -Force -Path $binaryRoot, $downloadRoot | Out-Null
@@ -28,9 +29,29 @@ if ($ready) {
     exit 0
 }
 
-Invoke-WebRequest -Uri $archiveUrl -OutFile $archivePath -UseBasicParsing
-if ((Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash -ne $archiveSha256) {
-    throw "FFmpeg archive checksum verification failed."
+if (!(Test-Path -LiteralPath $archivePath -PathType Leaf) -or (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash -ne $archiveSha256) {
+    Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
+    $maximumAttempts = 5
+    for ($attempt = 1; $attempt -le $maximumAttempts; $attempt++) {
+        Remove-Item -LiteralPath $partialArchivePath -Force -ErrorAction SilentlyContinue
+        try {
+            Write-Host "Downloading pinned FFmpeg archive (attempt $attempt of $maximumAttempts)..."
+            Invoke-WebRequest -Uri $archiveUrl -OutFile $partialArchivePath -UseBasicParsing
+            if ((Get-FileHash -LiteralPath $partialArchivePath -Algorithm SHA256).Hash -ne $archiveSha256) {
+                throw "Downloaded FFmpeg archive failed checksum verification."
+            }
+            Move-Item -LiteralPath $partialArchivePath -Destination $archivePath -Force
+            break
+        } catch {
+            Remove-Item -LiteralPath $partialArchivePath -Force -ErrorAction SilentlyContinue
+            if ($attempt -eq $maximumAttempts) {
+                throw "Could not download the pinned FFmpeg archive after $maximumAttempts attempts: $($_.Exception.Message)"
+            }
+            $delaySeconds = [Math]::Pow(2, $attempt)
+            Write-Warning "FFmpeg download attempt $attempt failed: $($_.Exception.Message). Retrying in $delaySeconds seconds."
+            Start-Sleep -Seconds $delaySeconds
+        }
+    }
 }
 
 if (Test-Path -LiteralPath $extractRoot) { Remove-Item -LiteralPath $extractRoot -Recurse -Force }
