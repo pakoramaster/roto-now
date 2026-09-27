@@ -39,6 +39,8 @@
     "resources": [
       "bin/ffmpeg.exe",
       "bin/ffprobe.exe",
+      "model-manifest.json",
+      "windows/install-required-models.ps1",
       "THIRD_PARTY_NOTICES.md"
     ],
     "createUpdaterArtifacts": true,
