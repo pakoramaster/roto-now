@@ -84,7 +84,9 @@ try {
     }
     $requiredAssets = @(
         "bin\ffmpeg.exe",
-        "bin\ffprobe.exe"
+        "bin\ffprobe.exe",
+        "model-manifest.json",
+        "windows\install-required-models.ps1"
     )
     foreach ($relativePath in $requiredAssets) {
         if (!(Test-Path -LiteralPath (Join-Path $installRoot $relativePath) -PathType Leaf)) {

@@ -51,6 +51,15 @@ if (!$tauriConfig.plugins.updater.pubkey -or $tauriConfig.plugins.updater.pubkey
 if (@($tauriConfig.plugins.updater.endpoints).Count -ne 1 -or $tauriConfig.plugins.updater.endpoints[0] -notmatch 'github\.com/pakoramaster/roto-now/releases/latest/download/latest\.json') { throw "The updater must target the latest stable GitHub Release." }
 $bundledModels = @($tauriConfig.bundle.resources | Where-Object { $_ -like 'models/*' })
 if ($bundledModels.Count -ne 0) { throw "Model weights must not be embedded in the installer." }
+$requiredInstallerResources = @(
+    "model-manifest.json",
+    "windows/install-required-models.ps1"
+)
+foreach ($resource in $requiredInstallerResources) {
+    if (@($tauriConfig.bundle.resources) -notcontains $resource) {
+        throw "Required installer resource is not bundled: $resource"
+    }
+}
 
 $general = @($modelManifest.models | Where-Object id -eq 'generalLite')
 $maximum = @($modelManifest.models | Where-Object id -eq 'general')
