@@ -297,7 +297,9 @@ function App() {
   const checkForUpdates = async () => {
     if (!canCheckForUpdates()) { setUpdatePhase("current"); setUpdateMessage("Update checks are available in installed release builds."); return; }
     try {
-      await pendingUpdate.current?.close(); pendingUpdate.current = null;
+      const previousUpdate = pendingUpdate.current;
+      pendingUpdate.current = null;
+      await previousUpdate?.close().catch(() => undefined);
       setUpdatePhase("checking"); setUpdateMessage("Checking the latest stable GitHub Release…"); setUpdatePercent(null);
       const update = await checkForAppUpdate();
       if (!update) { setUpdatePhase("current"); setUpdateMessage("Roto Now is up to date."); return; }
@@ -306,7 +308,9 @@ function App() {
   };
 
   const dismissUpdate = async () => {
-    await pendingUpdate.current?.close().catch(() => undefined); pendingUpdate.current = null; setUpdatePhase("idle"); setUpdatePercent(null); setUpdateMessage("Check GitHub Releases for a newer stable build.");
+    const update = pendingUpdate.current;
+    pendingUpdate.current = null;
+    await update?.close().catch(() => undefined); setUpdatePhase("idle"); setUpdatePercent(null); setUpdateMessage("Check GitHub Releases for a newer stable build.");
   };
 
   const installUpdate = async () => {
@@ -322,7 +326,7 @@ function App() {
         setUpdatePhase("installing"); setUpdateMessage("Installing the update. Roto Now will restart…"); setUpdatePercent(100);
       });
       await relaunchAfterUpdate();
-    } catch (caught) { setUpdatePhase("error"); setUpdateMessage(`Update failed: ${String(caught)}`); }
+    } catch (caught) { setUpdatePhase("error"); setUpdatePercent(null); setUpdateMessage(`Update failed: ${String(caught)}`); }
   };
 
   const startSeedJob = async (customMaskPath?: string) => {

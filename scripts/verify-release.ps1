@@ -42,6 +42,9 @@ if (@($tauriConfig.app.security.assetProtocol.scope) -contains "**") {
 if (@($capability.permissions) -contains "core:default") {
     throw "The desktop capability must grant only the core APIs used by the frontend."
 }
+if (@($capability.permissions) -notcontains "core:resources:allow-close") {
+    throw "The desktop capability must allow updater resources to be closed before retrying an update check."
+}
 if ($tauriConfig.bundle.windows.allowDowngrades -ne $false) {
     throw "Windows installer downgrades must be disabled."
 }
