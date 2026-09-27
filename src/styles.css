@@ -117,10 +117,9 @@ h1 span { color: #7e8881; }
 .control-group { display: block; padding: 12px 0 0; }
 .control-group > span { display: block; font-size: var(--type-sm); font-weight: 700; margin-bottom: 9px; color: #d3d9d5; }
 .control-group small { display: block; color: #7c867f; font-size: var(--type-xs); margin-top: 7px; line-height: 1.45; }
-.image-model-control > span { font-size: var(--type-md); }
-.image-model-control > small:not(.download-needed) { font-size: var(--type-sm); }
+.image-model-control { display: grid; gap: 6px; }
+.image-model-control > span { margin-bottom: 0; color: #9aa49d; font-size: var(--type-xs); }
 .segmented { display: grid; grid-template-columns: repeat(2,1fr); border-radius: 8px; padding: 3px; background: #0d100e; border: 1px solid #292e2a; }
-.segmented.image-models { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .segmented button { height: var(--control-sm); border: 0; border-radius: 6px; background: transparent; color: #828c85; font-size: var(--type-sm); cursor: pointer; }
 .segmented button.active { background: #252b26; color: #eef3ef; box-shadow: 0 2px 8px rgba(0,0,0,.25); }
 .color-options { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }

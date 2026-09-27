@@ -5,12 +5,10 @@
 
   Remove image, video, and animated GIF backgrounds locally on Windows.
 
-  **Current source version: 0.5.1**
 
-  The installed app needs no account, uploads no media, and requires no separate Python or FFmpeg setup.
 </div>
 
----
+
 
 ## What it does
 
@@ -68,22 +66,6 @@ Your original file is never overwritten. Roto Now creates results in its managed
 
 General, Maximum, and Anime are segmentation models. Cutie High Detail is the tracking model and uses an editable first-frame segmentation mask.
 
-## Choosing settings
-
-| Setting | Best for | Trade-off |
-| --- | --- | --- |
-| **General** | Most photographs and objects | Fast general-purpose processing |
-| **Maximum** | Difficult edges and fine structures | Highest detail with slower, CPU-based inference |
-| **Anime** | Illustrations and line art | Specialized for stylized edges |
-| **First-frame mask model** | Creating a primary-subject tracking seed | Used only for the editable seed, not subsequent Cutie tracking |
-| **Green / Blue** | Video editing and keying | Choose the colour least present in the subject |
-| **Cutie High Detail** | One person or object that should remain consistent | 960×544 internal sequential tracking; sensitive to occlusion and scene cuts |
-
-General and Anime prefer DirectML on Windows and fall back to CPU if GPU allocation or execution fails. Maximum uses the larger general model on CPU. The application keeps the active inference session alive instead of recreating it for every video frame.
-
-For video and GIF inputs, General, Maximum, or Anime creates only the editable first-frame mask. Cutie High Detail then propagates that mask through the sequence with DirectML and CPU fallback.
-
-The first-frame mask is the tracking contract: anything included there may be followed. Remove chairs, beds, background objects, and other unwanted regions before starting the full export.
 
 ## Tips for better results
 
@@ -100,7 +82,6 @@ The first-frame mask is the tracking contract: anything included there may be fo
 - Cutie tracks the marked primary subject sequentially, but it can drift after long occlusions, abrupt cuts, or when the frame-0 mask contains other objects. It does not automatically re-seed at scene cuts.
 - Fast motion, motion blur, transparent objects, fine flyaway hair, and low subject/background contrast can still produce unstable edges.
 - Video and GIF output uses a solid green or blue screen; transparent motion-media export is not currently provided.
-- GIF output is silent by format.
 - One processing or model-download job runs at a time.
 
 ---
@@ -219,4 +200,4 @@ npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis
 
 Large model weights, FFmpeg executables, signing keys, virtual environments, local toolchains, and generated build output are intentionally excluded from Git.
 
-The Windows release workflow verifies the synchronized semantic version, model manifest, permissions, bundle resources, frontend, and Rust tests. It then builds and smoke-tests the installer, verifies updater artifacts, and publishes the installer/updater package and `latest.json` to the matching `v<version>` GitHub Release. The generated `.sig` remains an internal workflow artifact whose contents are embedded in `latest.json`; it is not published separately. Authenticode signing is applied when the Windows certificate secrets are configured.
+The Windows release workflow verifies the synchronized semantic version, model manifest, permissions, bundle resources, frontend, and Rust tests. It then builds and smoke-tests the installer, verifies updater artifacts, and publishes the installer, signed updater package, signature, and `latest.json` to the matching `v<version>` GitHub Release. Authenticode signing is applied when the Windows certificate secrets are configured.
