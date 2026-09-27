@@ -6,10 +6,12 @@
 /src-tauri/bin/*.exe
 /src-tauri/models/*.onnx
 /src-tauri/models/*.part
+/src-tauri/models/cutie-high/
 /.toolchains
 /.python-env
 /.models
 /.runtime-test
+/.secrets
 /backend/__pycache__
 *.log
 .DS_Store

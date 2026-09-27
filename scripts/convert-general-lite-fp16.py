@@ -1,9 +1,8 @@
-"""Create Roto Now's GPU-only FP16 General Lite model.
+"""Create Roto Now's General FP16 model.
 
 The conversion keeps float32 inputs and outputs so native preprocessing and
-postprocessing stay unchanged. CPU inference deliberately continues to use
-the bundled FP32 model because ONNX Runtime's CPU provider does not implement
-all float16 operators used by BiRefNet.
+postprocessing stay unchanged. The generated model is used by both DirectML
+and the CPU fallback after compatibility has been validated locally.
 """
 
 from pathlib import Path

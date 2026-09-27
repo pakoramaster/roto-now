@@ -1,34 +1,16 @@
 $ErrorActionPreference = "Stop"
-
-$modelUrl = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx"
-$modelSha256 = "5600024376F572A557870A5EB0AFB1E5961636BEF4E1E22132025467D0F03333"
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$modelRoot = Join-Path $projectRoot "src-tauri\models"
-$modelPath = Join-Path $modelRoot "birefnet-general-lite.onnx"
-$partialPath = "$modelPath.part"
-
-New-Item -ItemType Directory -Force -Path $modelRoot | Out-Null
-if ((Test-Path -LiteralPath $modelPath) -and (Get-FileHash -LiteralPath $modelPath -Algorithm SHA256).Hash -eq $modelSha256) {
-    Write-Host "Pinned General Lite FP32 model is already ready."
-} else {
-    Invoke-WebRequest -Uri $modelUrl -OutFile $partialPath -UseBasicParsing
-    if ((Get-FileHash -LiteralPath $partialPath -Algorithm SHA256).Hash -ne $modelSha256) {
-        Remove-Item -LiteralPath $partialPath -Force
-        throw "General Lite model checksum verification failed."
-    }
-    Move-Item -LiteralPath $partialPath -Destination $modelPath -Force
-}
-
-$fp16Path = Join-Path $modelRoot "birefnet-general-lite-fp16.onnx"
-$fp16Sha256 = "311CFD8088EE71224BA0687B00DFAD1ED28FC05AAE0CE64E87965CC3D4B29D6A"
-if (!(Test-Path -LiteralPath $fp16Path) -or (Get-FileHash -LiteralPath $fp16Path -Algorithm SHA256).Hash -ne $fp16Sha256) {
-    $python = Join-Path $projectRoot ".python-env\Scripts\python.exe"
-    if (!(Test-Path -LiteralPath $python)) {
-        throw "The project Python environment is required to create the FP16 bundle model."
-    }
-    & $python (Join-Path $PSScriptRoot "convert-general-lite-fp16.py")
-    if ($LASTEXITCODE -ne 0 -or (Get-FileHash -LiteralPath $fp16Path -Algorithm SHA256).Hash -ne $fp16Sha256) {
-        throw "FP16 General Lite conversion failed checksum verification."
-    }
-}
-Write-Host "Pinned FP32 and FP16 General Lite models are ready for packaging."
+$manifest = Get-Content (Join-Path $projectRoot "src-tauri\model-manifest.json") -Raw | ConvertFrom-Json
+$asset = $manifest.models | Where-Object id -eq "generalLite"
+if (!$asset -or $asset.role -ne "required") { throw "Required General FP16 asset is missing from the model manifest." }
+$destinationRoot = Join-Path $projectRoot ".models\rembg"
+$destination = Join-Path $destinationRoot $asset.destination
+$partial = "$destination.part"
+New-Item -ItemType Directory -Force -Path $destinationRoot | Out-Null
+function Test-General([string]$Path) { (Test-Path -LiteralPath $Path -PathType Leaf) -and ((Get-Item -LiteralPath $Path).Length -eq [long]$asset.size) -and ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -eq $asset.sha256) }
+if (Test-General $destination) { Write-Host "Pinned General FP16 model is ready for development."; return }
+$localSource = Join-Path $projectRoot "src-tauri\models\$($asset.destination)"
+if (Test-General $localSource) { Copy-Item -LiteralPath $localSource -Destination $partial -Force } else { Invoke-WebRequest -Uri $asset.url -OutFile $partial -UseBasicParsing }
+if (!(Test-General $partial)) { Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue; throw "General FP16 model failed checksum verification." }
+Move-Item -LiteralPath $partial -Destination $destination -Force
+Write-Host "Pinned General FP16 model is ready for development."

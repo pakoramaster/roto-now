@@ -1,6 +1,6 @@
 [package]
 name = "roto-now"
-version = "0.4.5"
+version = "0.5.0"
 description = "Local AI-assisted rotoscoping for images and video"
 authors = ["Roto Now"]
 edition = "2021"
@@ -25,6 +25,8 @@ serde_json = "1"
 sha2 = "0.10"
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-process = "2"
+tauri-plugin-updater = "2"
 tokio = { version = "1", features = ["fs", "io-util", "process", "sync", "time"] }
 uuid = { version = "1", features = ["v4"] }
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

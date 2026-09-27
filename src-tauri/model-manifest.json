@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "models": [
+    {
+      "id": "generalLite",
+      "name": "General",
+      "role": "required",
+      "version": "1",
+      "url": "https://github.com/pakoramaster/roto-now/releases/download/dependencies-models-v1/birefnet-general-lite-fp16.onnx",
+      "size": 114538787,
+      "sha256": "311cfd8088ee71224ba0687b00dfad1ed28fc05aae0ce64e87965cc3d4b29d6a",
+      "destination": "birefnet-general-lite-fp16.onnx",
+      "archiveMembers": []
+    },
+    {
+      "id": "general",
+      "name": "Maximum",
+      "role": "optional",
+      "version": "1",
+      "url": "https://github.com/danielgatis/rembg/releases/download/v0.0.0/BiRefNet-general-epoch_244.onnx",
+      "size": 972666916,
+      "sha256": "58f621f00f5d756097615970a88a791584600dcf7c45b18a0a6267535a1ebd3c",
+      "destination": "birefnet-general.onnx",
+      "archiveMembers": []
+    },
+    {
+      "id": "anime",
+      "name": "Anime",
+      "role": "optional",
+      "version": "1",
+      "url": "https://huggingface.co/sprited/birefnet-toonout-onnx/resolve/main/birefnet-toonout-fp16.onnx?download=true",
+      "size": 492381880,
+      "sha256": "213a8a98ee426ef8f02d247eb5a5a9889359e37c2e1e7e31e282d61034d08a83",
+      "destination": "birefnet-toonout-fp16.onnx",
+      "archiveMembers": []
+    }
+  ],
+  "cutie": {
+    "id": "cutieHigh",
+    "name": "Cutie High Detail",
+    "role": "required",
+    "version": "1",
+    "url": "https://github.com/pakoramaster/roto-now/releases/download/dependencies-models-v1/cutie-high.zip",
+    "size": 131949289,
+    "sha256": "56c5b4823610c8f87b551b82893ef0450f900c254b4ff729f24aec30dea2124f",
+    "destination": "cutie-high",
+    "width": 960,
+    "height": 544,
+    "archiveMembers": [
+      { "path": "cutie-encode-key-960x544.onnx", "sha256": "1469b0fd27d9308588974c552a8859c21a49b6c75097b7be85e7ab39d311a7f0" },
+      { "path": "cutie-encode-value-960x544.onnx", "sha256": "b9ea3fbe634f7829a1f68367ade26fb6ec3b6219ed60ed1656126796a3494436" },
+      { "path": "cutie-memory-readout-floatmask-valid-960x544-m6-topk30-opencv.onnx", "sha256": "5f0a0eb4a53b8f69b57db6bdef11cc310a34579ef173bc722951849cec2ea220" },
+      { "path": "cutie-decode-960x544.onnx", "sha256": "3110a899612f71fead613a479d616b2acc1144ffbcbdec047333b739c485c6cd" }
+    ]
+  }
+}

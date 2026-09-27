@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Roto Now",
-  "version": "0.4.5",
+  "version": "0.5.0",
   "identifier": "com.rotonow.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -39,10 +39,9 @@
     "resources": [
       "bin/ffmpeg.exe",
       "bin/ffprobe.exe",
-      "models/birefnet-general-lite.onnx",
-      "models/birefnet-general-lite-fp16.onnx",
       "THIRD_PARTY_NOTICES.md"
     ],
+    "createUpdaterArtifacts": true,
     "windows": {
       "allowDowngrades": false,
       "signCommand": {
@@ -52,10 +51,18 @@
       "nsis": {
         "installMode": "currentUser",
         "compression": "lzma",
-        "languages": ["English"]
+        "languages": ["English"],
+        "installerHooks": "windows/installer-hooks.nsh"
       }
     },
     "shortDescription": "Local AI-assisted rotoscoping",
     "longDescription": "Remove image backgrounds and create green or blue screen video locally."
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": ["https://github.com/pakoramaster/roto-now/releases/latest/download/latest.json"],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdBMEU5NTM3NUE4MEUxMzYKUldRMjRZQmFONVVPZWw0a3RVYVV6dnBMczVIZnJrWUFiallCZ2JaY0FsVHY4TW9wK24zYjBSZEEK",
+      "windows": { "installMode": "passive" }
+    }
   }
 }

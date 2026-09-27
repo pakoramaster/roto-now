@@ -13,16 +13,12 @@ fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 8 {
         return Err(
-            "usage: cutie_video_smoke <model-dir> <ffmpeg.exe> <ffprobe.exe> <input-video> <seed-cutout.png> <output.mp4> <green|blue>"
+            "usage: cutie_video_smoke <model-dir> <ffmpeg.exe> <ffprobe.exe> <input-video-or-gif> <seed-cutout.png> <output.mp4|output.gif> <green|blue>"
                 .into(),
         );
     }
     let root = PathBuf::from(&args[1]);
-    let (width, height) = if std::env::var("ROTO_NOW_CUTIE_TIER").as_deref() == Ok("high") {
-        (960, 544)
-    } else {
-        (640, 368)
-    };
+    let (width, height) = (960, 544);
     let size = format!("{width}x{height}");
     let paths = CutieModelPaths {
         encode_key: root.join(format!("cutie-encode-key-{size}.onnx")),

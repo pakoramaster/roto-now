@@ -1,8 +1,7 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$InstallerPath,
-    [string]$SandboxRoot,
-    [switch]$RequireAllModels
+    [string]$SandboxRoot
 )
 
 $ErrorActionPreference = "Stop"
@@ -60,7 +59,10 @@ Remove-Sandbox
 New-Item -ItemType Directory -Force -Path $SandboxRoot | Out-Null
 
 function Invoke-Installer {
-    $process = Start-Process -FilePath $installer -ArgumentList @("/S", "/D=$installRoot") -Wait -PassThru -WindowStyle Hidden
+    $previousSkip = $env:ROTO_NOW_SKIP_MODEL_SETUP
+    $env:ROTO_NOW_SKIP_MODEL_SETUP = "1"
+    try { $process = Start-Process -FilePath $installer -ArgumentList @("/S", "/D=$installRoot") -Wait -PassThru -WindowStyle Hidden }
+    finally { $env:ROTO_NOW_SKIP_MODEL_SETUP = $previousSkip }
     if ($process.ExitCode -ne 0) {
         throw "Silent installer exited with code $($process.ExitCode)."
     }
@@ -82,16 +84,8 @@ try {
     }
     $requiredAssets = @(
         "bin\ffmpeg.exe",
-        "bin\ffprobe.exe",
-        "models\birefnet-general-lite.onnx",
-        "models\birefnet-general-lite-fp16.onnx"
+        "bin\ffprobe.exe"
     )
-    if ($RequireAllModels) {
-        $requiredAssets += @(
-            "models\birefnet-general.onnx",
-            "models\birefnet-toonout-fp16.onnx"
-        )
-    }
     foreach ($relativePath in $requiredAssets) {
         if (!(Test-Path -LiteralPath (Join-Path $installRoot $relativePath) -PathType Leaf)) {
             throw "Installed bundle asset is missing: $relativePath"
@@ -105,7 +99,9 @@ try {
     if (Test-Path -LiteralPath $application.FullName) {
         throw "Uninstall left the application executable behind."
     }
-    Write-Host "Installer install, repair, bundle-content, and uninstall smoke checks passed."
+    $embeddedModels = @(Get-ChildItem -LiteralPath $installRoot -Recurse -File -Filter "*.onnx" -ErrorAction SilentlyContinue)
+    if ($embeddedModels.Count -ne 0) { throw "Slim installer unexpectedly embedded model weights." }
+    Write-Host "Slim installer install, repair, bundle-content, and uninstall smoke checks passed."
 } finally {
     Stop-SandboxApplication
     if ($uninstallerPath -and (Test-Path -LiteralPath $uninstallerPath)) {
