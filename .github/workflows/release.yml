@@ -179,7 +179,7 @@ jobs:
           $signature = $signatures[0]
           $updaterPackage = Get-Item -LiteralPath $signature.FullName.Substring(0, $signature.FullName.Length - 4)
           $latestJson = Get-Item -LiteralPath (Join-Path $installer.Directory 'latest.json')
-          $releaseAssets = @($installer.FullName, $updaterPackage.FullName, $signature.FullName, $latestJson.FullName) | Select-Object -Unique
+          $releaseAssets = @($installer.FullName, $updaterPackage.FullName, $latestJson.FullName) | Select-Object -Unique
           gh release view $env:RELEASE_TAG --json tagName 2>$null | Out-Null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $env:RELEASE_TAG $releaseAssets --clobber
