@@ -165,13 +165,20 @@ jobs:
           if ($remoteTag) {
             $tagCommit = ($remoteTag -split '\s+')[0]
             if ($tagCommit -ne $env:GITHUB_SHA) {
-              throw "Release tag $env:RELEASE_TAG already points to another commit. Increment the app version before releasing."
+              Write-Host "Moving existing release tag $env:RELEASE_TAG from $tagCommit to $env:GITHUB_SHA."
+              git tag --force $env:RELEASE_TAG $env:GITHUB_SHA
+              git push origin "refs/tags/$env:RELEASE_TAG" --force
+              if ($LASTEXITCODE -ne 0) { throw "Could not move release tag $env:RELEASE_TAG to the current commit." }
             }
           } else {
             git tag $env:RELEASE_TAG $env:GITHUB_SHA
             git push origin "refs/tags/$env:RELEASE_TAG"
             if ($LASTEXITCODE -ne 0) { throw "Could not create release tag $env:RELEASE_TAG." }
           }
+
+          $publishedTag = git ls-remote origin "refs/tags/$env:RELEASE_TAG"
+          $publishedCommit = ($publishedTag -split '\s+')[0]
+          if ($publishedCommit -ne $env:GITHUB_SHA) { throw "Release tag $env:RELEASE_TAG does not point to the current commit after publishing." }
 
           $installers = @(Get-ChildItem "src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis\*.exe")
           if ($installers.Count -ne 1) { throw "Expected exactly one NSIS installer, found $($installers.Count)." }
