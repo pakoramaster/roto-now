@@ -102,7 +102,9 @@ jobs:
           $packagePath = $signature.FullName.Substring(0, $signature.FullName.Length - 4)
           if (!(Test-Path -LiteralPath $packagePath -PathType Leaf)) { throw "Signed updater package is missing: $packagePath" }
           $package = Get-Item -LiteralPath $packagePath
-          $encodedName = [Uri]::EscapeDataString($package.Name)
+          # GitHub normalizes spaces in uploaded release asset names to periods.
+          $publishedPackageName = $package.Name.Replace(' ', '.')
+          $encodedName = [Uri]::EscapeDataString($publishedPackageName)
           $latest = [ordered]@{
             version = $env:RELEASE_VERSION
             notes = "Roto Now $env:RELEASE_VERSION"
