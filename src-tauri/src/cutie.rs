@@ -124,7 +124,10 @@ impl CutieTracker {
         if !paths.all_exist() {
             return Err("Cutie Primary Subject is not installed".into());
         }
-        if paths.width == 0 || paths.height == 0 || paths.width % 16 != 0 || paths.height % 16 != 0
+        if paths.width == 0
+            || paths.height == 0
+            || !paths.width.is_multiple_of(16)
+            || !paths.height.is_multiple_of(16)
         {
             return Err("Cutie model dimensions must be positive multiples of 16".into());
         }
@@ -602,7 +605,7 @@ mod tests {
     use super::*;
     #[test]
     #[ignore = "requires installed Cutie models and real media; set ROTO_NOW_MEMORY_TEST_ROOT"]
-    fn installed_cache_releases_history_and_handles_tier_load_failure() {
+    fn installed_cache_releases_history_after_processing_failure() {
         let root =
             PathBuf::from(std::env::var_os("ROTO_NOW_MEMORY_TEST_ROOT").expect("fixture root"));
         let paths = |tier: &str, width, height| {
@@ -619,7 +622,6 @@ mod tests {
                 height,
             }
         };
-        let balanced = paths("cutie-medium", 640, 368);
         let high = paths("cutie-high", 960, 544);
         let frame = image::open(root.join(".runtime-test/cutie-first-frame.png"))
             .unwrap()
@@ -632,19 +634,9 @@ mod tests {
         });
         let control = crate::jobs::JobState::default().begin().unwrap();
         let cache = CutieSessionCache::default();
-        for (index, model_paths) in [
-            balanced.clone(),
-            balanced.clone(),
-            balanced.clone(),
-            high.clone(),
-            high,
-            balanced,
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (index, model_paths) in [high.clone(), high.clone(), high].into_iter().enumerate() {
             let result: Result<(), String> = cache.with_tracker(model_paths, |tracker, reused| {
-                assert_eq!(reused, matches!(index, 1 | 2 | 4));
+                assert_eq!(reused, index > 0);
                 tracker.step(&frame, Some(&seed), &control)?;
                 assert!(tracker.permanent_memory.is_some());
                 println!(

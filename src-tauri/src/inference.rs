@@ -125,24 +125,19 @@ struct ModelFingerprint {
     path: PathBuf,
     length: u64,
     modified: Option<std::time::SystemTime>,
-    accelerated: Option<(u64, Option<std::time::SystemTime>)>,
 }
 
 impl ModelFingerprint {
-    fn read(path: PathBuf, model_id: ModelId) -> Result<Self, String> {
+    fn read(path: PathBuf, _model_id: ModelId) -> Result<Self, String> {
         let metadata = fs::metadata(&path)
             .map_err(|error| format!("Could not inspect model {}: {error}", path.display()))?;
         if !metadata.is_file() {
             return Err(format!("Model path is not a file: {}", path.display()));
         }
-        let accelerated = crate::models::accelerated_model_path(&path, model_id)
-            .and_then(|path| fs::metadata(path).ok())
-            .map(|metadata| (metadata.len(), metadata.modified().ok()));
         Ok(Self {
             path,
             length: metadata.len(),
             modified: metadata.modified().ok(),
-            accelerated,
         })
     }
 }
@@ -228,14 +223,7 @@ impl Masker {
             ));
         }
 
-        let accelerated_path = (std::env::var_os("ROTO_NOW_DISABLE_FP16").as_deref()
-            != Some(std::ffi::OsStr::new("1")))
-        .then(|| crate::models::accelerated_model_path(&path, model_id))
-        .flatten();
-        // FP32 General Lite can exhaust shared GPU memory. Use the CPU
-        // fallback when its low-memory companion is unavailable.
-        if prefer_directml && (model_id != ModelId::GeneralLite || accelerated_path.is_some()) {
-            let dml_path = accelerated_path.as_ref().unwrap_or(&path);
+        if prefer_directml {
             let directml = (|| {
                 let builder = Session::builder()
                     .map_err(|error| error.to_string())?
@@ -257,7 +245,7 @@ impl Masker {
                         .build()])
                     .map_err(|error| error.to_string())?;
                 builder
-                    .commit_from_file(dml_path)
+                    .commit_from_file(&path)
                     .map_err(|error| error.to_string())
             })();
             if let Ok(session) = directml {
@@ -265,8 +253,8 @@ impl Masker {
                     session: Some(session),
                     model_id,
                     provider: "DmlExecutionProvider",
-                    precision: model_precision(dml_path),
-                    model_path: dml_path.clone(),
+                    precision: model_precision(&path),
+                    model_path: path.clone(),
                     fallback_model_path: path,
                     input_scratch: Vec::new(),
                     mask_scratch: Vec::new(),

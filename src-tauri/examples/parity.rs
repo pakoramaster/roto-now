@@ -30,9 +30,15 @@ fn main() -> Result<(), String> {
         cancelled: Arc::new(AtomicBool::new(false)),
         progress_high_water: Arc::new(AtomicU64::new(0)),
     };
-    let mut masker = Masker::load_from_path(PathBuf::from(&args[2]), model_id, false)?;
+    let prefer_directml =
+        std::env::var_os("ROTO_NOW_FORCE_CPU").as_deref() != Some(std::ffi::OsStr::new("1"));
+    let mut masker = Masker::load_from_path(PathBuf::from(&args[2]), model_id, prefer_directml)?;
     let output = masker.apply(&source, 72, "Balanced", &control)?;
     save_cutout(&output, PathBuf::from(&args[4]).as_path())?;
-    println!("provider={}", masker.provider());
+    println!(
+        "provider={} precision={}",
+        masker.provider(),
+        masker.precision()
+    );
     Ok(())
 }

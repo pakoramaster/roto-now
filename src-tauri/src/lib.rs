@@ -71,6 +71,7 @@ fn extension_kind(path: &Path) -> Option<(&'static str, &'static str)> {
         "png" => Some(("image", "image/png")),
         "jpg" | "jpeg" => Some(("image", "image/jpeg")),
         "webp" => Some(("image", "image/webp")),
+        "gif" => Some(("video", "image/gif")),
         "mp4" => Some(("video", "video/mp4")),
         "mov" => Some(("video", "video/quicktime")),
         "webm" => Some(("video", "video/webm")),
@@ -83,7 +84,7 @@ fn managed_temp_root() -> PathBuf {
 }
 
 fn new_managed_output(extension: &str) -> Result<PathBuf, String> {
-    if !matches!(extension, "png" | "mp4") {
+    if !matches!(extension, "png" | "mp4" | "gif") {
         return Err("Unsupported managed output type".into());
     }
     let root = managed_temp_root();
@@ -108,7 +109,7 @@ fn is_managed_output_path(path: &Path) -> bool {
         && name.starts_with("result-")
         && matches!(
             path.extension().and_then(|value| value.to_str()),
-            Some("png" | "mp4")
+            Some("png" | "mp4" | "gif")
         )
 }
 
@@ -165,7 +166,7 @@ fn inspect_media(app: AppHandle, path: String) -> Result<MediaInfo, String> {
         return Err("The selected path is not a file".into());
     }
     let (kind, _mime) =
-        extension_kind(&source).ok_or("Choose a PNG, JPG, WEBP, MP4, MOV, or WEBM file")?;
+        extension_kind(&source).ok_or("Choose a PNG, JPG, WEBP, GIF, MP4, MOV, or WEBM file")?;
     let maximum = if kind == "image" {
         MAX_IMAGE_BYTES
     } else {
@@ -294,7 +295,7 @@ fn start_image_job(
                     job_id: control.id.clone(),
                     result: ProcessResult {
                         output_path: output.to_string_lossy().into_owned(),
-                        model: models::spec(model_id).name.into(),
+                        model: models::spec(model_id).name.clone(),
                         provider,
                         precision,
                         pipeline: "single image".into(),
@@ -351,6 +352,7 @@ fn start_image_job(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn start_video_job(
     app: AppHandle,
     jobs: State<'_, JobState>,
@@ -362,29 +364,19 @@ fn start_video_job(
     screen_color: String,
     preview: bool,
     start_seconds: Option<f64>,
-    tracking_mode: Option<String>,
     seed_mask_path: Option<String>,
-    tracker_quality: Option<String>,
 ) -> Result<String, String> {
     let input = verify_input(&input_path, "video")?;
-    let tracking_mode = tracking_mode.unwrap_or_else(|| "temporal".into());
-    if !matches!(tracking_mode.as_str(), "temporal" | "cutie") {
-        return Err("Unknown video tracking mode".into());
-    }
     let seed_mask = seed_mask_path.map(PathBuf::from);
-    let cutie_tier =
-        cutie_models::CutieTier::parse(tracker_quality.as_deref().unwrap_or("balanced"))?;
-    if tracking_mode == "cutie" {
+    if !preview {
         let path = seed_mask
             .as_ref()
             .ok_or("Primary Subject mode requires a first-frame mask")?;
         if outputs.outputs.lock().get(path) != Some(&false) || !is_managed_output_file(path) {
             return Err("Choose a first-frame mask created by Roto Now".into());
         }
-        if !cutie_models::model_paths(&app, cutie_tier)?.all_exist() {
-            return Err(
-                "The selected Cutie quality tier must be downloaded before processing".into(),
-            );
+        if !cutie_models::model_paths(&app)?.all_exist() {
+            return Err("Cutie High Detail must be installed before processing".into());
         }
     }
     if !matches!(screen_color.as_str(), "green" | "blue") {
@@ -397,13 +389,22 @@ fn start_video_job(
         quality_mode
     };
     let model_id = routing::select_model(&model, selected_quality)?;
-    if (preview || tracking_mode == "temporal") && !models::model_path(&app, model_id)?.is_file() {
+    if preview && !models::model_path(&app, model_id)?.is_file() {
         return Err(format!(
             "{} must be downloaded before processing",
             models::spec(model_id).name
         ));
     }
-    let output = new_managed_output(if preview { "png" } else { "mp4" })?;
+    let gif_input = input
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gif"));
+    let output = new_managed_output(if preview {
+        "png"
+    } else if gif_input {
+        "gif"
+    } else {
+        "mp4"
+    })?;
     let control = jobs.begin()?;
     let job_id = control.id.clone();
     let app_for_task = app.clone();
@@ -421,9 +422,7 @@ fn start_video_job(
             &screen_color,
             preview,
             start_seconds.unwrap_or(0.0),
-            &tracking_mode,
             seed_mask.as_deref(),
-            cutie_tier,
         );
         match outcome {
             Ok(value) => emit(
@@ -432,13 +431,10 @@ fn start_video_job(
                     job_id: control.id.clone(),
                     result: ProcessResult {
                         output_path: output.to_string_lossy().into_owned(),
-                        model: if tracking_mode == "cutie" {
-                            match cutie_tier {
-                                cutie_models::CutieTier::Balanced => "Cutie Balanced".into(),
-                                cutie_models::CutieTier::High => "Cutie High Detail".into(),
-                            }
+                        model: if preview {
+                            models::spec(model_id).name.clone()
                         } else {
-                            models::spec(model_id).name.into()
+                            "Cutie High Detail".into()
                         },
                         provider: value.provider,
                         precision: value.precision,
@@ -496,6 +492,7 @@ fn start_video_job(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn start_video_seed_job(
     app: AppHandle,
     jobs: State<'_, JobState>,
@@ -569,7 +566,7 @@ fn start_video_seed_job(
                         model: if imported_mask.is_some() {
                             "Attached PNG mask".into()
                         } else {
-                            models::spec(model_id).name.into()
+                            models::spec(model_id).name.clone()
                         },
                         provider: value.provider,
                         precision: value.precision,
@@ -750,6 +747,8 @@ pub fn run() {
     cleanup_stale_outputs();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(JobState::default())
         .manage(OutputState::default())
         .manage(ModelSessionCache::default())
@@ -761,7 +760,6 @@ pub fn run() {
             models::download_model,
             models::remove_model,
             cutie_models::download_cutie,
-            cutie_models::remove_cutie,
             models::cancel_job,
             start_image_job,
             start_video_job,
@@ -782,6 +780,10 @@ mod tests {
     #[test]
     fn media_extensions_are_allowlisted_case_insensitively() {
         assert_eq!(extension_kind(Path::new("photo.PNG")).unwrap().0, "image");
+        assert_eq!(
+            extension_kind(Path::new("animation.GIF")).unwrap().0,
+            "video"
+        );
         assert_eq!(extension_kind(Path::new("clip.MOV")).unwrap().0, "video");
         assert!(extension_kind(Path::new("payload.exe")).is_none());
         assert!(extension_kind(Path::new("no-extension")).is_none());
@@ -792,6 +794,7 @@ mod tests {
         let root = managed_temp_root();
         assert!(is_managed_output_path(&root.join("result-10-20.png")));
         assert!(is_managed_output_path(&root.join("result-10-20.mp4")));
+        assert!(is_managed_output_path(&root.join("result-10-20.gif")));
         assert!(!is_managed_output_path(&root.join("unrelated.png")));
         assert!(!is_managed_output_path(
             &root.join("nested").join("result-10-20.png")
@@ -801,6 +804,17 @@ mod tests {
                 .with_file_name("roto-now-elsewhere")
                 .join("result-10-20.png")
         ));
+    }
+
+    #[test]
+    fn managed_output_allocator_accepts_gif_and_rejects_unknown_types() {
+        let output = new_managed_output("gif").unwrap();
+        assert_eq!(output.parent(), Some(managed_temp_root().as_path()));
+        assert_eq!(
+            output.extension().and_then(|value| value.to_str()),
+            Some("gif")
+        );
+        assert!(new_managed_output("exe").is_err());
     }
 
     #[test]

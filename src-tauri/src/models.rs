@@ -6,7 +6,7 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
-    sync::atomic::Ordering,
+    sync::{atomic::Ordering, OnceLock},
 };
 use tauri::{AppHandle, Manager, State};
 use tokio::io::AsyncWriteExt;
@@ -40,51 +40,75 @@ pub struct BootstrapStatus {
     pub trackers: Vec<crate::cutie_models::CutieStatus>,
 }
 
-pub struct ModelSpec {
-    pub id: ModelId,
-    pub name: &'static str,
-    pub file: &'static str,
-    pub url: &'static str,
-    pub sha256: &'static str,
-    pub size: u64,
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveMember {
+    pub path: String,
+    pub sha256: String,
 }
 
-pub const MODEL_SPECS: [ModelSpec; 3] = [
-    ModelSpec {
-        id: ModelId::GeneralLite,
-        name: "General Lite",
-        file: "birefnet-general-lite.onnx",
-        url: "https://github.com/danielgatis/rembg/releases/download/v0.0.0/BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx",
-        sha256: "5600024376f572a557870a5eb0afb1e5961636bef4e1e22132025467d0f03333",
-        size: 224_005_088,
-    },
-    ModelSpec {
-        id: ModelId::General,
-        name: "General Maximum",
-        file: "birefnet-general.onnx",
-        url: "https://github.com/danielgatis/rembg/releases/download/v0.0.0/BiRefNet-general-epoch_244.onnx",
-        sha256: "58f621f00f5d756097615970a88a791584600dcf7c45b18a0a6267535a1ebd3c",
-        size: 972_666_916,
-    },
-    ModelSpec {
-        id: ModelId::Anime,
-        name: "Anime ToonOut",
-        file: "birefnet-toonout-fp16.onnx",
-        url: "https://huggingface.co/sprited/birefnet-toonout-onnx/resolve/main/birefnet-toonout-fp16.onnx?download=true",
-        sha256: "213a8a98ee426ef8f02d247eb5a5a9889359e37c2e1e7e31e282d61034d08a83",
-        size: 492_381_880,
-    },
-];
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSpec {
+    pub id: ModelId,
+    pub name: String,
+    pub role: String,
+    pub version: String,
+    pub url: String,
+    pub size: u64,
+    pub sha256: String,
+    pub destination: String,
+    pub archive_members: Vec<ArchiveMember>,
+}
 
-pub const GENERAL_LITE_FP16_FILE: &str = "birefnet-general-lite-fp16.onnx";
-pub const GENERAL_LITE_FP16_SHA256: &str =
-    "311cfd8088ee71224ba0687b00dfad1ed28fc05aae0ce64e87965cc3d4b29d6a";
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CutieSpec {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub version: String,
+    pub url: String,
+    pub size: u64,
+    pub sha256: String,
+    pub destination: String,
+    pub width: usize,
+    pub height: usize,
+    pub archive_members: Vec<ArchiveMember>,
+}
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelManifest {
+    schema_version: u32,
+    models: Vec<ModelSpec>,
+    cutie: CutieSpec,
+}
+
+fn manifest() -> &'static ModelManifest {
+    static MANIFEST: OnceLock<ModelManifest> = OnceLock::new();
+    MANIFEST.get_or_init(|| {
+        let parsed: ModelManifest = serde_json::from_str(include_str!("../model-manifest.json"))
+            .expect("the embedded model manifest is valid");
+        assert_eq!(
+            parsed.schema_version, 1,
+            "unsupported model manifest schema"
+        );
+        parsed
+    })
+}
+
+pub fn specs() -> &'static [ModelSpec] {
+    &manifest().models
+}
 pub fn spec(id: ModelId) -> &'static ModelSpec {
-    MODEL_SPECS
+    specs()
         .iter()
         .find(|item| item.id == id)
         .expect("model registry is complete")
+}
+pub fn cutie_spec() -> &'static CutieSpec {
+    &manifest().cutie
 }
 
 pub fn model_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -112,14 +136,8 @@ pub fn model_path(app: &AppHandle, id: ModelId) -> Result<PathBuf, String> {
     Ok(managed)
 }
 
-pub fn accelerated_model_path(model_path: &Path, id: ModelId) -> Option<PathBuf> {
-    (id == ModelId::GeneralLite)
-        .then(|| model_path.with_file_name(GENERAL_LITE_FP16_FILE))
-        .filter(|path| path.is_file())
-}
-
 fn managed_model_path(app: &AppHandle, id: ModelId) -> Result<PathBuf, String> {
-    Ok(model_root(app)?.join(spec(id).file))
+    Ok(model_root(app)?.join(&spec(id).destination))
 }
 
 #[cfg(debug_assertions)]
@@ -135,78 +153,23 @@ fn development_model_path_from_root(root: &Path, id: ModelId) -> PathBuf {
     } else {
         "rembg"
     };
-    root.join(folder).join(spec(id).file)
-}
-
-fn seed_bundled_file(
-    root: &Path,
-    resources: &Path,
-    file: &str,
-    expected_sha256: &str,
-    label: &str,
-) -> Result<(), String> {
-    let bundled = resources.join("models").join(file);
-    if !bundled.is_file() {
-        return Ok(());
-    }
-
-    let destination = root.join(file);
-    let marker = root.join(format!(
-        ".bundled-{}-{}-seeded",
-        file.trim_end_matches(".onnx"),
-        &expected_sha256[..12]
-    ));
-    if marker.is_file() && destination.is_file() {
-        return Ok(());
-    }
-    if destination.is_file() && sha256_file(&destination)? == expected_sha256 {
-        std::fs::write(marker, b"1")
-            .map_err(|error| format!("Could not finish bundled model setup: {error}"))?;
-        return Ok(());
-    }
-    if sha256_file(&bundled)? != expected_sha256 {
-        return Err(format!(
-            "The bundled {label} model failed checksum verification"
-        ));
-    }
-
-    let partial = destination.with_extension("onnx.part");
-    std::fs::copy(&bundled, &partial)
-        .map_err(|error| format!("Could not install bundled {label}: {error}"))?;
-    if sha256_file(&partial)? != expected_sha256 {
-        let _ = std::fs::remove_file(&partial);
-        return Err(format!(
-            "The installed {label} copy failed checksum verification"
-        ));
-    }
-    atomic_replace(&partial, &destination)?;
-    std::fs::write(marker, b"1")
-        .map_err(|error| format!("Could not finish bundled model setup: {error}"))?;
-    Ok(())
-}
-
-fn seed_bundled_models(app: &AppHandle) -> Result<(), String> {
-    let root = model_root(app)?;
-    let resources = app
-        .path()
-        .resource_dir()
-        .map_err(|error| format!("Could not locate bundled resources: {error}"))?;
-    for item in MODEL_SPECS.iter() {
-        seed_bundled_file(&root, &resources, item.file, item.sha256, item.name)?;
-    }
-    seed_bundled_file(
-        &root,
-        &resources,
-        GENERAL_LITE_FP16_FILE,
-        GENERAL_LITE_FP16_SHA256,
-        "FP16 General Lite",
-    )
+    root.join(folder).join(&spec(id).destination)
 }
 
 fn status_for(app: &AppHandle, item: &'static ModelSpec) -> ModelStatus {
     let managed_path = managed_model_path(app, item.id).ok();
     let path = model_path(app, item.id).ok();
-    let installed = path.as_ref().map(|path| path.is_file()).unwrap_or(false);
+    let installed = path.as_ref().is_some_and(|path| {
+        if !path.is_file() {
+            return false;
+        }
+        if item.role != "required" {
+            return true;
+        }
+        path.metadata()
+            .is_ok_and(|metadata| metadata.len() == item.size)
+            && sha256_file(path).is_ok_and(|hash| hash == item.sha256)
+    });
     let managed = installed
         && path
             .as_ref()
@@ -214,11 +177,10 @@ fn status_for(app: &AppHandle, item: &'static ModelSpec) -> ModelStatus {
             .is_some_and(|(resolved, managed)| resolved == managed);
     let partial = managed_path
         .as_ref()
-        .map(|path| path.with_extension("onnx.part").is_file())
-        .unwrap_or(false);
+        .is_some_and(|path| path.with_extension("onnx.part").is_file());
     ModelStatus {
         id: item.id,
-        name: item.name,
+        name: item.name.as_str(),
         size: item.size,
         installed,
         managed,
@@ -241,11 +203,7 @@ fn status_for(app: &AppHandle, item: &'static ModelSpec) -> ModelStatus {
 
 #[tauri::command]
 pub fn get_bootstrap_status(app: AppHandle) -> Result<BootstrapStatus, String> {
-    seed_bundled_models(&app)?;
-    let models: Vec<_> = MODEL_SPECS
-        .iter()
-        .map(|item| status_for(&app, item))
-        .collect();
+    let models: Vec<_> = specs().iter().map(|item| status_for(&app, item)).collect();
     Ok(BootstrapStatus {
         ready: models
             .iter()
@@ -256,7 +214,7 @@ pub fn get_bootstrap_status(app: AppHandle) -> Result<BootstrapStatus, String> {
     })
 }
 
-fn sha256_file(path: &Path) -> Result<String, String> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String, String> {
     let mut file = File::open(path).map_err(|error| format!("Could not verify model: {error}"))?;
     let mut hash = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
@@ -304,10 +262,10 @@ async fn download_once(
         existing = 0;
     }
     let client = reqwest::Client::builder()
-        .user_agent("RotoNow/0.1")
+        .user_agent("RotoNow/0.5")
         .build()
         .map_err(|error| error.to_string())?;
-    let mut request = client.get(item.url);
+    let mut request = client.get(&item.url);
     if existing > 0 {
         request = request.header(reqwest::header::RANGE, format!("bytes={existing}-"));
     }
@@ -366,13 +324,11 @@ async fn download_once(
         None,
         format!("Verifying {}", item.name),
     );
-    let actual = sha256_file(&partial)?;
-    if actual != item.sha256 {
+    if sha256_file(&partial)? != item.sha256 {
         let _ = tokio::fs::remove_file(&partial).await;
         return Err("Downloaded model failed checksum verification".into());
     }
-    atomic_replace(&partial, destination)?;
-    Ok(())
+    atomic_replace(&partial, destination)
 }
 
 #[cfg(windows)]
@@ -443,7 +399,6 @@ pub fn download_model(
             }
         }
         if control.cancelled.load(Ordering::SeqCst) {
-            let _ = tokio::fs::remove_file(destination.with_extension("onnx.part")).await;
             emit(
                 &app_for_task,
                 JobEvent::Cancelled {
@@ -463,7 +418,7 @@ pub fn download_model(
                 &app_for_task,
                 JobEvent::Completed {
                     job_id: control.id.clone(),
-                    result: crate::jobs::ProcessResult::model_download(item.name),
+                    result: crate::jobs::ProcessResult::model_download(item.name.as_str()),
                 },
             );
         }
@@ -478,6 +433,9 @@ pub fn remove_model(
     cache: State<'_, crate::inference::ModelSessionCache>,
     model_id: ModelId,
 ) -> Result<(), String> {
+    if spec(model_id).role == "required" {
+        return Err("General is required and cannot be removed".into());
+    }
     cache.invalidate(model_id);
     let path = managed_model_path(&app, model_id)?;
     if path.exists() {
@@ -499,20 +457,28 @@ pub fn cancel_job(state: State<'_, JobState>, job_id: String) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn registry_has_pinned_sha256_values() {
-        assert_eq!(MODEL_SPECS.len(), 3);
-        for model in MODEL_SPECS.iter() {
+    fn manifest_has_required_general_and_optional_models() {
+        assert_eq!(specs().len(), 3);
+        assert_eq!(spec(ModelId::GeneralLite).role, "required");
+        assert_eq!(
+            spec(ModelId::GeneralLite).destination,
+            "birefnet-general-lite-fp16.onnx"
+        );
+        assert_eq!(spec(ModelId::General).role, "optional");
+        assert_eq!(spec(ModelId::Anime).role, "optional");
+        for model in specs() {
             assert_eq!(model.sha256.len(), 64);
-            assert!(model.sha256.bytes().all(|value| value.is_ascii_hexdigit()));
             assert!(model.size > 10_000_000);
         }
     }
-
     #[test]
-    fn development_models_follow_the_reference_folder_layout() {
+    fn development_models_follow_reference_layout() {
         let root = Path::new("test-models");
+        assert_eq!(
+            development_model_path_from_root(root, ModelId::GeneralLite),
+            root.join("rembg").join("birefnet-general-lite-fp16.onnx")
+        );
         assert_eq!(
             development_model_path_from_root(root, ModelId::General),
             root.join("rembg").join("birefnet-general.onnx")

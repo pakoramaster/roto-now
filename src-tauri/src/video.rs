@@ -269,9 +269,22 @@ fn even(value: f64) -> u32 {
     ((value.round().max(2.0) as u32) / 2) * 2
 }
 
-fn normalized_dimensions(width: u32, height: u32, sample_aspect: f64, rotation: i32) -> (u32, u32) {
-    let square_width = even(width as f64 * sample_aspect);
-    let square_height = even(height as f64);
+fn normalized_dimensions(
+    width: u32,
+    height: u32,
+    sample_aspect: f64,
+    rotation: i32,
+    require_even: bool,
+) -> (u32, u32) {
+    let normalize = |value: f64| {
+        if require_even {
+            even(value)
+        } else {
+            value.round().max(1.0) as u32
+        }
+    };
+    let square_width = normalize(width as f64 * sample_aspect);
+    let square_height = normalize(height as f64);
     if matches!(rotation, 90 | 270) {
         (square_height, square_width)
     } else {
@@ -410,11 +423,15 @@ fn probe(ffprobe: &Path, source: &Path) -> Result<VideoMeta, String> {
     let coded_height = video.height.ok_or("Video height is unavailable")?;
     crate::media_limits::video_frame_bytes(coded_width, coded_height)?;
     let rotation = normalized_rotation(video);
+    let require_even = source
+        .extension()
+        .is_none_or(|extension| !extension.eq_ignore_ascii_case("gif"));
     let (width, height) = normalized_dimensions(
         coded_width,
         coded_height,
         parse_aspect_ratio(video.sample_aspect_ratio.as_deref()),
         rotation,
+        require_even,
     );
     crate::media_limits::video_frame_bytes(width, height)?;
     let color = color_spec(video, width, height);
@@ -559,22 +576,22 @@ fn validate_export(
     fps: f64,
 ) -> Result<(), String> {
     let result = probe(ffprobe, output)
-        .map_err(|error| format!("The encoded MP4 could not be validated: {error}"))?;
+        .map_err(|error| format!("The encoded motion result could not be validated: {error}"))?;
     if result.width != expected_width || result.height != expected_height {
         return Err(format!(
-            "The encoded MP4 has unexpected dimensions ({}x{} instead of {expected_width}x{expected_height})",
+            "The encoded motion result has unexpected dimensions ({}x{} instead of {expected_width}x{expected_height})",
             result.width, result.height
         ));
     }
     let tolerance = (0.6 / fps.max(1.0)).max(0.08);
     if (result.duration - expected_duration).abs() > tolerance {
         return Err(format!(
-            "The encoded MP4 duration drifted by {:.3} seconds",
+            "The encoded motion result duration drifted by {:.3} seconds",
             result.duration - expected_duration
         ));
     }
     if expected_audio && !result.has_audio {
-        return Err("The encoded MP4 is missing the source audio".into());
+        return Err("The encoded video is missing the source audio".into());
     }
     Ok(())
 }
@@ -849,18 +866,16 @@ pub fn process_video(
     screen_color: &str,
     preview: bool,
     start_seconds: f64,
-    tracking_mode: &str,
     seed_mask: Option<&Path>,
-    cutie_tier: crate::cutie_models::CutieTier,
 ) -> Result<VideoOutcome, String> {
     let ffmpeg = bundled_binary(app, "ffmpeg")?;
     let ffprobe = bundled_binary(app, "ffprobe")?;
     let model_path = crate::models::model_path(app, model_id)?;
-    if !preview && tracking_mode == "cutie" {
+    if !preview {
         app.state::<crate::inference::ModelSessionCache>()
             .invalidate_all();
         let seed_mask = seed_mask.ok_or("Primary Subject mode requires a first-frame mask")?;
-        let paths = crate::cutie_models::model_paths(app, cutie_tier)?;
+        let paths = crate::cutie_models::model_paths(app)?;
         return app.state::<crate::cutie::CutieSessionCache>().with_tracker(
             paths,
             |tracker, reused| {
@@ -955,6 +970,9 @@ fn process_video_with_cutie(
     let quality_mode = QualityMode::parse(quality)?;
     let meta = probe(ffprobe, input)?;
     let (width, height, total) = (meta.width, meta.height, meta.frames);
+    let gif_output = output
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gif"));
     let seed_image = crate::media_limits::open_image(seed_path)
         .map_err(|error| format!("Could not open first-frame mask: {error}"))?;
     let rgba = seed_image.to_rgba8();
@@ -984,9 +1002,13 @@ fn process_video_with_cutie(
             Some(total),
             None,
             format!(
-                "Preparing {} Cutie tracking and {} encoding",
+                "Preparing {} Cutie tracking and {}",
                 tracker.provider().trim_end_matches("ExecutionProvider"),
-                video_encoder.label()
+                if gif_output {
+                    "animated GIF encoding"
+                } else {
+                    video_encoder.label()
+                }
             ),
         );
     }
@@ -1034,34 +1056,54 @@ fn process_video_with_cutie(
         meta.fps_arg.clone(),
         "-i".into(),
         "pipe:0".into(),
-        "-i".into(),
-        input.to_string_lossy().into_owned(),
-        "-map".into(),
-        "0:v:0".into(),
     ];
-    if meta.has_audio {
-        encode_args.extend(["-map".into(), "1:a:0?".into()]);
+    if gif_output {
+        encode_args.extend([
+            "-map".into(),
+            "0:v:0".into(),
+            "-an".into(),
+            "-c:v".into(),
+            "gif".into(),
+            "-pix_fmt".into(),
+            "rgb8".into(),
+            "-fps_mode".into(),
+            "cfr".into(),
+            "-loop".into(),
+            "0".into(),
+            "-map_metadata".into(),
+            "-1".into(),
+        ]);
     } else {
-        encode_args.push("-an".into());
-    }
-    append_video_encoder_args(&mut encode_args, quality_mode, video_encoder);
-    encode_args.extend([
-        "-vf".into(),
-        rgb_to_yuv_filter(&meta.color),
-        "-pix_fmt".into(),
-        "yuv420p".into(),
-        "-fps_mode".into(),
-        "cfr".into(),
-        "-map_metadata".into(),
-        "-1".into(),
-        "-metadata:s:v:0".into(),
-        "rotate=0".into(),
-        "-movflags".into(),
-        "+faststart".into(),
-    ]);
-    append_color_args(&mut encode_args, &meta.color, video_encoder);
-    if meta.has_audio {
-        encode_args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "192k".into(), "-af".into(), format!("atrim=duration={clip_duration:.6},asetpts=PTS-STARTPTS,aresample=async=1000:first_pts=0")]);
+        encode_args.extend([
+            "-i".into(),
+            input.to_string_lossy().into_owned(),
+            "-map".into(),
+            "0:v:0".into(),
+        ]);
+        if meta.has_audio {
+            encode_args.extend(["-map".into(), "1:a:0?".into()]);
+        } else {
+            encode_args.push("-an".into());
+        }
+        append_video_encoder_args(&mut encode_args, quality_mode, video_encoder);
+        encode_args.extend([
+            "-vf".into(),
+            rgb_to_yuv_filter(&meta.color),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+            "-fps_mode".into(),
+            "cfr".into(),
+            "-map_metadata".into(),
+            "-1".into(),
+            "-metadata:s:v:0".into(),
+            "rotate=0".into(),
+            "-movflags".into(),
+            "+faststart".into(),
+        ]);
+        append_color_args(&mut encode_args, &meta.color, video_encoder);
+        if meta.has_audio {
+            encode_args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "192k".into(), "-af".into(), format!("atrim=duration={clip_duration:.6},asetpts=PTS-STARTPTS,aresample=async=1000:first_pts=0")]);
+        }
     }
     encode_args.push(output.to_string_lossy().into_owned());
     let mut encoder = background_command(ffmpeg)
@@ -1210,7 +1252,7 @@ fn process_video_with_cutie(
         width,
         height,
         clip_duration,
-        meta.has_audio,
+        meta.has_audio && !gif_output,
         output_fps,
     )?;
     let (tracker_width, tracker_height) = tracker.internal_size();
@@ -1219,14 +1261,15 @@ fn process_video_with_cutie(
         provider: tracker.provider().into(),
         precision: "FP32".into(),
         pipeline: format!(
-            "Cutie primary-subject memory propagation at {tracker_width}x{tracker_height}"
+            "Cutie primary-subject memory propagation at {tracker_width}x{tracker_height} with {} output",
+            if gif_output { "animated GIF" } else { "H.264 MP4" }
         ),
         performance,
         width,
         height,
         frame_rate: output_fps,
         duration: clip_duration,
-        has_audio: meta.has_audio,
+        has_audio: meta.has_audio && !gif_output,
     })
 }
 
@@ -1915,8 +1958,12 @@ mod tests {
 
     #[test]
     fn display_dimensions_normalize_rotation_aspect_and_odd_sizes() {
-        assert_eq!(normalized_dimensions(1921, 1081, 1.0, 0), (1920, 1080));
-        assert_eq!(normalized_dimensions(320, 214, 2.0, 90), (214, 640));
+        assert_eq!(
+            normalized_dimensions(1921, 1081, 1.0, 0, true),
+            (1920, 1080)
+        );
+        assert_eq!(normalized_dimensions(320, 214, 2.0, 90, true), (214, 640));
+        assert_eq!(normalized_dimensions(165, 165, 1.0, 0, false), (165, 165));
     }
 
     #[test]

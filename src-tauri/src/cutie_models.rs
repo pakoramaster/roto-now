@@ -3,95 +3,30 @@ use crate::{
     jobs::{emit, emit_progress, JobEvent, JobState, ProcessResult},
 };
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use serde::Serialize;
 use std::{
     fs::File,
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
     sync::atomic::Ordering,
 };
 use tauri::{AppHandle, Manager, State};
 use tokio::io::AsyncWriteExt;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum CutieTier {
-    Balanced,
-    High,
-}
+use crate::models::CutieSpec;
 
-impl CutieTier {
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "balanced" => Ok(Self::Balanced),
-            "high" => Ok(Self::High),
-            _ => Err("Unknown Cutie quality tier".into()),
-        }
-    }
-}
-
-struct CutieSpec {
-    tier: CutieTier,
-    id: &'static str,
-    name: &'static str,
-    folder: &'static str,
-    asset: &'static str,
-    sha256: &'static str,
-    size: u64,
-    width: usize,
-    height: usize,
-}
-
-const BASE_URL: &str = "https://github.com/OpenShot/openshot-onnx/releases/download/v0.2.0";
-const SPECS: [CutieSpec; 2] = [
-    CutieSpec {
-        tier: CutieTier::Balanced,
-        id: "cutieBalanced",
-        name: "Cutie Balanced",
-        folder: "cutie-medium",
-        asset: "cutie-opencv-medium-640x368.zip",
-        sha256: "64f79a30d4e53f2aad597772968f18dcc3806ef8dfbe1fefcbf4b58fac069709",
-        size: 130_823_166,
-        width: 640,
-        height: 368,
-    },
-    CutieSpec {
-        tier: CutieTier::High,
-        id: "cutieHigh",
-        name: "Cutie High Detail",
-        folder: "cutie-high",
-        asset: "cutie-opencv-high-960x544.zip",
-        sha256: "56c5b4823610c8f87b551b82893ef0450f900c254b4ff729f24aec30dea2124f",
-        size: 131_949_289,
-        width: 960,
-        height: 544,
-    },
-];
-
-fn spec(tier: CutieTier) -> &'static CutieSpec {
-    SPECS
+fn files(spec: &CutieSpec) -> Vec<String> {
+    spec.archive_members
         .iter()
-        .find(|item| item.tier == tier)
-        .expect("Cutie tier registry is complete")
-}
-
-fn files(spec: &CutieSpec) -> [String; 4] {
-    let size = format!("{}x{}", spec.width, spec.height);
-    [
-        format!("cutie-encode-key-{size}.onnx"),
-        format!("cutie-encode-value-{size}.onnx"),
-        format!("cutie-memory-readout-floatmask-valid-{size}-m6-topk30-opencv.onnx"),
-        format!("cutie-decode-{size}.onnx"),
-    ]
+        .map(|member| member.path.clone())
+        .collect()
 }
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CutieStatus {
-    pub id: &'static str,
-    pub tier: CutieTier,
-    pub name: &'static str,
+    pub id: String,
+    pub name: String,
     pub size: u64,
     pub width: usize,
     pub height: usize,
@@ -102,7 +37,7 @@ pub struct CutieStatus {
 }
 
 fn managed_dir(app: &AppHandle, spec: &CutieSpec) -> Result<PathBuf, String> {
-    Ok(crate::models::model_root(app)?.join(spec.folder))
+    Ok(crate::models::model_root(app)?.join(&spec.destination))
 }
 
 fn paths_in(root: &Path, spec: &CutieSpec) -> CutieModelPaths {
@@ -117,15 +52,15 @@ fn paths_in(root: &Path, spec: &CutieSpec) -> CutieModelPaths {
     }
 }
 
-pub fn model_paths(app: &AppHandle, tier: CutieTier) -> Result<CutieModelPaths, String> {
-    let spec = spec(tier);
+pub fn model_paths(app: &AppHandle) -> Result<CutieModelPaths, String> {
+    let spec = crate::models::cutie_spec();
     let managed = paths_in(&managed_dir(app, spec)?, spec);
     if managed.all_exist() {
         return Ok(managed);
     }
     #[cfg(debug_assertions)]
     if let Some(root) = std::env::var_os("ROTO_NOW_MODEL_ROOT") {
-        let local = paths_in(&PathBuf::from(root).join(spec.folder), spec);
+        let local = paths_in(&PathBuf::from(root).join(&spec.destination), spec);
         if local.all_exist() {
             return Ok(local);
         }
@@ -135,8 +70,18 @@ pub fn model_paths(app: &AppHandle, tier: CutieTier) -> Result<CutieModelPaths, 
 
 fn status(app: &AppHandle, spec: &'static CutieSpec) -> CutieStatus {
     let managed_root = managed_dir(app, spec).ok();
-    let paths = model_paths(app, spec.tier).ok();
-    let installed = paths.as_ref().is_some_and(CutieModelPaths::all_exist);
+    let paths = model_paths(app).ok();
+    let installed = paths.as_ref().is_some_and(|paths| {
+        paths.all_exist()
+            && spec.archive_members.iter().all(|member| {
+                let path = paths
+                    .encode_key
+                    .parent()
+                    .unwrap_or(Path::new(""))
+                    .join(&member.path);
+                crate::models::sha256_file(&path).is_ok_and(|hash| hash == member.sha256)
+            })
+    });
     let managed = installed
         && paths
             .as_ref()
@@ -146,9 +91,8 @@ fn status(app: &AppHandle, spec: &'static CutieSpec) -> CutieStatus {
         .as_ref()
         .is_some_and(|root| root.with_extension("zip.part").is_file());
     CutieStatus {
-        id: spec.id,
-        tier: spec.tier,
-        name: spec.name,
+        id: spec.id.clone(),
+        name: spec.name.clone(),
         size: spec.size,
         width: spec.width,
         height: spec.height,
@@ -168,28 +112,14 @@ fn status(app: &AppHandle, spec: &'static CutieSpec) -> CutieStatus {
 }
 
 pub fn statuses(app: &AppHandle) -> Vec<CutieStatus> {
-    SPECS.iter().map(|item| status(app, item)).collect()
-}
-
-fn sha256(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|error| format!("Could not verify Cutie: {error}"))?;
-    let mut hash = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
-        if count == 0 {
-            break;
-        }
-        hash.update(&buffer[..count]);
-    }
-    Ok(format!("{:x}", hash.finalize()))
+    vec![status(app, crate::models::cutie_spec())]
 }
 
 fn install_archive(archive: &Path, destination: &Path, spec: &CutieSpec) -> Result<(), String> {
     let parent = destination
         .parent()
         .ok_or("Cutie model directory is invalid")?;
-    let staging = parent.join(format!("{}-installing", spec.folder));
+    let staging = parent.join(format!("{}-installing", spec.destination));
     if staging.exists() {
         std::fs::remove_dir_all(&staging)
             .map_err(|error| format!("Could not clear Cutie staging folder: {error}"))?;
@@ -200,9 +130,10 @@ fn install_archive(archive: &Path, destination: &Path, spec: &CutieSpec) -> Resu
         File::open(archive).map_err(|error| format!("Could not open Cutie archive: {error}"))?;
     let mut zip =
         zip::ZipArchive::new(file).map_err(|error| format!("Invalid Cutie archive: {error}"))?;
-    for expected in files(spec) {
+    for member in &spec.archive_members {
+        let expected = &member.path;
         let mut entry = zip
-            .by_name(&expected)
+            .by_name(expected)
             .map_err(|_| format!("Cutie archive is missing {expected}"))?;
         if entry.is_dir()
             || entry
@@ -214,11 +145,17 @@ fn install_archive(archive: &Path, destination: &Path, spec: &CutieSpec) -> Resu
         {
             return Err("Cutie archive contains an unsafe entry".into());
         }
-        let mut output = File::create(staging.join(&expected))
+        let output_path = staging.join(expected);
+        let mut output = File::create(&output_path)
             .map_err(|error| format!("Could not install Cutie model: {error}"))?;
         std::io::copy(&mut entry, &mut output)
             .map_err(|error| format!("Could not extract Cutie model: {error}"))?;
         output.flush().map_err(|error| error.to_string())?;
+        if crate::models::sha256_file(&output_path)? != member.sha256 {
+            return Err(format!(
+                "Cutie archive member {expected} failed checksum verification"
+            ));
+        }
     }
     if !paths_in(&staging, spec).all_exist() {
         return Err("Cutie installation is incomplete".into());
@@ -246,7 +183,7 @@ async fn download(
         let _ = tokio::fs::remove_file(&partial).await;
         existing = 0;
     } else if existing == spec.size {
-        if sha256(&partial)? == spec.sha256 {
+        if crate::models::sha256_file(&partial)? == spec.sha256 {
             tokio::fs::rename(&partial, archive)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -259,7 +196,7 @@ async fn download(
         .user_agent("RotoNow/0.4")
         .build()
         .map_err(|e| e.to_string())?;
-    let mut request = client.get(format!("{BASE_URL}/{}", spec.asset));
+    let mut request = client.get(&spec.url);
     if existing > 0 {
         request = request.header(reqwest::header::RANGE, format!("bytes={existing}-"));
     }
@@ -301,7 +238,7 @@ async fn download(
     }
     file.flush().await.map_err(|e| e.to_string())?;
     drop(file);
-    if sha256(&partial)? != spec.sha256 {
+    if crate::models::sha256_file(&partial)? != spec.sha256 {
         let _ = tokio::fs::remove_file(&partial).await;
         return Err("Downloaded Cutie package failed checksum verification".into());
     }
@@ -315,9 +252,8 @@ pub fn download_cutie(
     app: AppHandle,
     jobs: State<'_, JobState>,
     cache: State<'_, crate::cutie::CutieSessionCache>,
-    tier: String,
 ) -> Result<String, String> {
-    let spec = spec(CutieTier::parse(&tier)?);
+    let spec = crate::models::cutie_spec();
     let destination = managed_dir(&app, spec)?;
     let archive = destination.with_extension("zip");
     let control = jobs.begin()?;
@@ -326,7 +262,7 @@ pub fn download_cutie(
     let app_for_task = app.clone();
     tauri::async_runtime::spawn(async move {
         let outcome = async {
-            if !archive.is_file() || sha256(&archive)? != spec.sha256 {
+            if !archive.is_file() || crate::models::sha256_file(&archive)? != spec.sha256 {
                 download(&app_for_task, &control, &archive, spec).await?;
             }
             emit_progress(
@@ -359,7 +295,7 @@ pub fn download_cutie(
         } else {
             JobEvent::Completed {
                 job_id: control.id.clone(),
-                result: ProcessResult::model_download(spec.name),
+                result: ProcessResult::model_download(&spec.name),
             }
         };
         emit(&app_for_task, event);
@@ -368,42 +304,22 @@ pub fn download_cutie(
     Ok(id)
 }
 
-#[tauri::command]
-pub fn remove_cutie(
-    app: AppHandle,
-    cache: State<'_, crate::cutie::CutieSessionCache>,
-    tier: String,
-) -> Result<(), String> {
-    let spec = spec(CutieTier::parse(&tier)?);
-    cache.invalidate();
-    let destination = managed_dir(&app, spec)?;
-    if destination.exists() {
-        std::fs::remove_dir_all(&destination)
-            .map_err(|e| format!("Could not remove {}: {e}", spec.name))?;
-    }
-    for path in [
-        destination.with_extension("zip"),
-        destination.with_extension("zip.part"),
-    ] {
-        if path.exists() {
-            std::fs::remove_file(path).map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn tiers_have_pinned_archives_and_stride_aligned_shapes() {
-        for item in SPECS.iter() {
-            assert_eq!(item.sha256.len(), 64);
-            assert_eq!(item.width % 16, 0);
-            assert_eq!(item.height % 16, 0);
-            assert!(item.size > 100_000_000);
-            assert_eq!(files(item).len(), 4);
-        }
+    fn high_detail_has_pinned_assets_and_stride_aligned_shape() {
+        let spec = crate::models::cutie_spec();
+        assert_eq!(spec.role, "required");
+        assert_eq!(spec.sha256.len(), 64);
+        assert_eq!(spec.width % 16, 0);
+        assert_eq!(spec.height % 16, 0);
+        assert!(spec.size > 100_000_000);
+        assert_eq!(files(spec).len(), 4);
+        assert!(spec
+            .archive_members
+            .iter()
+            .all(|member| member.sha256.len() == 64));
     }
 }
