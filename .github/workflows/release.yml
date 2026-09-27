@@ -2,6 +2,9 @@ name: Windows release
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 concurrency:
   group: windows-main-release
